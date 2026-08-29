@@ -1,4 +1,5 @@
 from errors import AssemblyError
+from expressions import evaluate_expression
 from opcodes import FORMAT2_SIGNATURES, OPCODES, REGISTERS
 from pass1 import encode_byte_operand, parse_line
 
@@ -61,6 +62,24 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
         text_record = ""
         text_start = -1
         mod_records = []
+        lines = f_in.readlines()
+
+        first_csect = next(iter(csects))
+        first_data = csects[first_csect]
+        execution_address = first_data['start']
+        end_line_number = None
+
+        for idx, source_line in enumerate(lines):
+            parts = source_line.strip('\n').split('\t', 1)
+            original = parts[1] if len(parts) == 2 else source_line
+            _, opcode, operand, is_comment = parse_line(original)
+            if not is_comment and opcode == 'END':
+                end_line_number = idx + 1
+                if operand:
+                    if operand not in first_data['symtab']:
+                        fail(end_line_number, f"END execution symbol is not defined in {first_csect}: {operand}")
+                    execution_address = first_data['symtab'][operand]
+                break
 
         def flush_text_record():
             nonlocal text_record, text_start
@@ -70,24 +89,37 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                 text_record = ""
                 text_start = -1
 
-        def start_csect(name, addr):
+        def start_csect(name):
             nonlocal current_csect, mod_records
             current_csect = name
-            csect_len = csects[name]['length']
-
+            data = csects[name]
             name_str = (name + "      ")[:6]
-            f_obj.write(f"H{name_str}{addr:06X}{csect_len:06X}\n")
+            f_obj.write(f"H{name_str}{data['start']:06X}{data['length']:06X}\n")
 
-            extdefs = csects[name]['extdef']
+            extdefs = data['extdef']
             if extdefs:
                 d_rec = "D"
                 for symbol in extdefs:
-                    if symbol in csects[name]['symtab']:
-                        d_addr = csects[name]['symtab'][symbol]
-                        d_rec += f"{symbol.ljust(6)[:6]}{d_addr:06X}"
+                    if symbol not in data['symtab']:
+                        raise AssemblyError(
+                            f"EXTDEF symbol is not defined locally: {symbol}",
+                            phase="pass 2",
+                        )
+                    if symbol not in data['relocatable']:
+                        raise AssemblyError(
+                            f"EXTDEF symbol must be relocatable: {symbol}",
+                            phase="pass 2",
+                        )
+                    relative = data['symtab'][symbol] - data['start']
+                    if not 0 <= relative <= 0xFFFFFF:
+                        raise AssemblyError(
+                            f"EXTDEF symbol is outside its control section: {symbol}",
+                            phase="pass 2",
+                        )
+                    d_rec += f"{symbol.ljust(6)[:6]}{relative:06X}"
                 f_obj.write(d_rec + "\n")
 
-            extrefs = csects[name]['extref']
+            extrefs = data['extref']
             if extrefs:
                 r_rec = "R"
                 for symbol in extrefs:
@@ -96,40 +128,28 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
 
             mod_records = []
 
-        def end_csect(write_e=False, exec_addr=None):
+        def end_csect():
             flush_text_record()
             for record in mod_records:
                 f_obj.write(f"{record}\n")
-            if write_e and exec_addr is not None:
-                f_obj.write(f"E{exec_addr:06X}\n")
+            if current_csect == first_csect:
+                f_obj.write(f"E{execution_address:06X}\n")
             else:
                 f_obj.write("E\n")
-
-        lines = f_in.readlines()
 
         for idx, line in enumerate(lines):
             line_number = idx + 1
             parts = line.strip('\n').split('\t', 1)
             if len(parts) != 2:
                 if "END" in line:
-                    _, _, operand, _ = parse_line(line)
                     f_lst.write(f"\t\t\t{line.strip()}\n")
-                    first_exec_addr = start_addr
-                    if operand and operand in csects[current_csect]['symtab']:
-                        first_exec_addr = csects[current_csect]['symtab'][operand]
-                    end_csect(write_e=True, exec_addr=first_exec_addr)
+                    end_csect()
                     break
                 continue
 
             addr_str = parts[0].strip()
             orig_line = parts[1].strip()
             current_pc = int(addr_str, 16) if addr_str else 0
-
-            next_pc = current_pc
-            if idx + 1 < len(lines):
-                next_parts = lines[idx + 1].strip('\n').split('\t', 1)
-                if len(next_parts) == 2 and next_parts[0].strip():
-                    next_pc = int(next_parts[0].strip(), 16)
 
             label, opcode, operand, is_comment = parse_line(orig_line)
             if is_comment:
@@ -138,32 +158,32 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
             obj_code = ""
 
             if opcode == 'START':
-                start_csect(label if label else "DEFAULT", current_pc)
+                start_csect(label if label else "DEFAULT")
                 f_lst.write(f"{addr_str}\t\t{orig_line}\n")
                 continue
 
             if opcode == 'CSECT':
                 end_csect()
-                start_csect(label if label else "UNNAMED", 0)
+                start_csect(label if label else "UNNAMED")
                 base_register = -1
                 f_lst.write(f"{addr_str}\t\t{orig_line}\n")
                 continue
 
             if opcode == 'END':
                 f_lst.write(f"\t\t\t{orig_line}\n")
-                first_exec_addr = start_addr
-                if operand and operand in csects[current_csect]['symtab']:
-                    first_exec_addr = csects[current_csect]['symtab'][operand]
-                end_csect(write_e=True, exec_addr=first_exec_addr)
+                end_csect()
                 break
 
+            data = csects[current_csect]
+            csect_start = data['start']
+
             if opcode == 'EXTDEF':
-                undefined = [
-                    symbol for symbol in csects[current_csect]['extdef']
-                    if symbol not in csects[current_csect]['symtab']
-                ]
+                undefined = [symbol for symbol in data['extdef'] if symbol not in data['symtab']]
                 if undefined:
                     fail(line_number, f"EXTDEF symbol is not defined locally: {undefined[0]}")
+                absolute = [symbol for symbol in data['extdef'] if symbol not in data['relocatable']]
+                if absolute:
+                    fail(line_number, f"EXTDEF symbol must be relocatable: {absolute[0]}")
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
 
@@ -172,9 +192,20 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                 continue
 
             if opcode == 'BASE':
-                if not operand or operand not in csects[current_csect]['symtab']:
-                    fail(line_number, f"BASE requires a defined local symbol: {operand}")
-                base_register = csects[current_csect]['symtab'][operand]
+                if not operand:
+                    fail(line_number, "BASE requires an operand")
+                if operand in data['extref']:
+                    fail(line_number, f"BASE cannot use an external reference: {operand}")
+                try:
+                    result = evaluate_expression(
+                        operand,
+                        current_pc,
+                        data['symtab'],
+                        data['relocatable'],
+                    )
+                except ValueError as exc:
+                    fail(line_number, str(exc))
+                base_register = result.value
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
 
@@ -207,6 +238,7 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                 elif fmt == 3:
                     n, i, x, b, p, e = 1, 1, 0, 0, 0, 0
                     disp = 0
+                    next_pc = current_pc + (4 if is_format4 else 3)
 
                     if is_format4:
                         e = 1
@@ -220,10 +252,10 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                         op_symbol = operand
                         if operand.startswith('#'):
                             n, i = 0, 1
-                            op_symbol = operand[1:]
+                            op_symbol = operand[1:].strip()
                         elif operand.startswith('@'):
                             n, i = 1, 0
-                            op_symbol = operand[1:]
+                            op_symbol = operand[1:].strip()
 
                         if op_symbol.endswith(',X'):
                             if (n, i) != (1, 1):
@@ -231,35 +263,34 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                             x = 1
                             op_symbol = op_symbol[:-2].strip()
 
+                        is_extref = op_symbol in data['extref']
                         target_addr = 0
-                        is_absolute = False
-                        is_extref = False
+                        relocatable = False
 
-                        if op_symbol.startswith('*'):
-                            offset = 0
-                            if len(op_symbol) > 1:
-                                try:
-                                    offset = int(op_symbol[1:])
-                                except ValueError:
-                                    fail(line_number, f"Invalid location-counter expression: {op_symbol}")
-                            target_addr = next_pc + offset
-                        elif op_symbol.isdigit() or (
-                            op_symbol.startswith('-') and op_symbol[1:].isdigit()
-                        ):
-                            target_addr = int(op_symbol)
-                            is_absolute = True
-                        elif op_symbol in csects[current_csect]['symtab']:
-                            target_addr = csects[current_csect]['symtab'][op_symbol]
-                        elif op_symbol in csects[current_csect]['extref']:
-                            is_extref = True
+                        if is_extref:
                             target_addr = 0
                         else:
-                            fail(
-                                line_number,
-                                f"Undefined symbol {op_symbol} in CSECT {current_csect}",
-                            )
+                            try:
+                                result = evaluate_expression(
+                                    op_symbol,
+                                    current_pc,
+                                    data['symtab'],
+                                    data['relocatable'],
+                                )
+                            except ValueError as exc:
+                                fail(line_number, str(exc))
+                            target_addr = result.value
+                            relocatable = result.relocatable
 
-                        if is_absolute:
+                        if is_extref:
+                            if e == 1:
+                                disp = 0
+                                mod_records.append(
+                                    f"M{current_pc + 1:06X}05+{op_symbol.ljust(6)[:6]}"
+                                )
+                            else:
+                                fail(line_number, f"External reference {op_symbol} requires Format 4")
+                        elif not relocatable:
                             if e:
                                 if not -(1 << 19) <= target_addr <= 0xFFFFF:
                                     fail(line_number, f"Format-4 constant out of 20-bit range: {target_addr}")
@@ -268,22 +299,12 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                 if not -2048 <= target_addr <= 4095:
                                     fail(line_number, f"Format-3 constant out of 12-bit range: {target_addr}")
                                 disp = target_addr & 0xFFF
-                        elif is_extref:
-                            if e == 1:
-                                disp = 0
-                                mod_records.append(
-                                    f"M{current_pc + 1:06X}05+{op_symbol.ljust(6)[:6]}"
-                                )
-                            else:
-                                fail(
-                                    line_number,
-                                    f"External reference {op_symbol} requires Format 4",
-                                )
                         else:
                             if e == 1:
-                                if not 0 <= target_addr <= 0xFFFFF:
-                                    fail(line_number, f"Format-4 address out of range: {target_addr}")
-                                disp = target_addr
+                                relative = target_addr - csect_start
+                                if not 0 <= relative <= 0xFFFFF:
+                                    fail(line_number, f"Format-4 relocatable address out of range: {target_addr}")
+                                disp = relative
                                 mod_records.append(
                                     f"M{current_pc + 1:06X}05+{current_csect.ljust(6)[:6]}"
                                 )
@@ -298,10 +319,7 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                         b = 1
                                         disp = disp_val & 0xFFF
                                     else:
-                                        fail(
-                                            line_number,
-                                            f"Displacement out of bounds for {opcode} {operand}",
-                                        )
+                                        fail(line_number, f"Displacement out of bounds for {opcode} {operand}")
                                 else:
                                     fail(
                                         line_number,
@@ -319,25 +337,42 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                         obj_code = f"{byte1:02X}{byte2:02X}{disp & 0xFF:02X}"
 
             elif opcode == 'WORD':
-                val = 0
-                if operand in csects[current_csect]['extref']:
+                if operand in data['extref']:
+                    value = 0
                     mod_records.append(f"M{current_pc:06X}06+{operand.ljust(6)[:6]}")
                 else:
                     try:
-                        val = int(operand, 10)
-                    except (TypeError, ValueError):
-                        fail(line_number, f"Unsupported WORD operand {operand}")
-                if not -(1 << 23) <= val <= 0xFFFFFF:
-                    fail(line_number, f"WORD value out of 24-bit range: {val}")
-                if val < 0:
-                    val = (1 << 24) + val
-                obj_code = f"{val:06X}"
+                        result = evaluate_expression(
+                            operand,
+                            current_pc,
+                            data['symtab'],
+                            data['relocatable'],
+                        )
+                    except ValueError as exc:
+                        fail(line_number, str(exc))
+                    if result.relocatable:
+                        value = result.value - csect_start
+                        mod_records.append(
+                            f"M{current_pc:06X}06+{current_csect.ljust(6)[:6]}"
+                        )
+                    else:
+                        value = result.value
+
+                if not -(1 << 23) <= value <= 0xFFFFFF:
+                    fail(line_number, f"WORD value out of 24-bit range: {value}")
+                if value < 0:
+                    value = (1 << 24) + value
+                obj_code = f"{value:06X}"
 
             elif opcode == 'BYTE':
                 try:
                     obj_code = encode_byte_operand(operand)
                 except ValueError as exc:
                     fail(line_number, str(exc))
+
+            elif opcode == 'EQU':
+                f_lst.write(f"{addr_str}\t\t\t{orig_line}\n")
+                continue
 
             elif opcode in ['RESW', 'RESB']:
                 pass
