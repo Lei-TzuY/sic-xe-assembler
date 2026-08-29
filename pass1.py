@@ -1,34 +1,44 @@
-from opcodes import OPCODES, DIRECTIVES
+from errors import AssemblyError
+from opcodes import DIRECTIVES, OPCODES
+
+
+def _strip_comment(line):
+    """Strip SIC/XE comments without treating periods inside literals as comments."""
+    in_quote = False
+    for index, char in enumerate(line):
+        if char == "'":
+            in_quote = not in_quote
+        elif char == '.' and not in_quote and (index == 0 or line[index - 1].isspace()):
+            return line[:index].rstrip()
+    return line.rstrip('\n')
 
 
 def parse_line(line):
-    if '.' in line:
-        line = line[:line.index('.')]
-    line = line.strip()
-    if not line:
+    had_leading_whitespace = bool(line[:1].isspace())
+    code = _strip_comment(line).strip()
+    if not code:
         return None, None, None, True
 
-    tokens = line.split()
-    label = None
-    opcode = None
-    operand = None
+    first_parts = code.split(None, 1)
+    first = first_parts[0]
+    remainder = first_parts[1].strip() if len(first_parts) > 1 else ""
 
-    def is_opcode(t):
-        raw = t[1:] if t.startswith('+') else t
-        return raw in OPCODES or t in DIRECTIVES
+    def is_opcode(token):
+        raw = token[1:] if token.startswith('+') else token
+        return raw in OPCODES or token in DIRECTIVES
 
-    if is_opcode(tokens[0]):
-        opcode = tokens[0]
-        if len(tokens) > 1:
-            operand = tokens[1]
-    else:
-        label = tokens[0]
-        if len(tokens) > 1:
-            opcode = tokens[1]
-        if len(tokens) > 2:
-            operand = tokens[2]
+    # Indentation convention disambiguates an unknown opcode from a label, so
+    # malformed instructions such as "    BADOP VALUE" get useful diagnostics.
+    if is_opcode(first) or had_leading_whitespace:
+        return None, first, remainder or None, False
 
-    return label, opcode, operand, False
+    if not remainder:
+        return first, None, None, False
+
+    opcode_parts = remainder.split(None, 1)
+    opcode = opcode_parts[0]
+    operand = opcode_parts[1].strip() if len(opcode_parts) > 1 else None
+    return first, opcode, operand, False
 
 
 def instruction_size(opcode):
@@ -47,24 +57,70 @@ def instruction_size(opcode):
     return fmt
 
 
+def encode_byte_operand(operand):
+    """Validate a BYTE operand and return its hexadecimal object representation."""
+    if not operand or len(operand) < 3 or operand[1] != "'" or not operand.endswith("'"):
+        raise ValueError(f"Invalid BYTE operand: {operand}")
+
+    kind = operand[0].upper()
+    payload = operand[2:-1]
+
+    if kind == 'C':
+        if any(ord(char) > 0xFF for char in payload):
+            raise ValueError("BYTE character constants must contain single-byte characters")
+        return "".join(f"{ord(char):02X}" for char in payload)
+
+    if kind == 'X':
+        if len(payload) % 2:
+            raise ValueError("BYTE hexadecimal constants must contain an even number of digits")
+        try:
+            int(payload or '0', 16)
+        except ValueError as exc:
+            raise ValueError(f"Invalid hexadecimal BYTE constant: {payload}") from exc
+        return payload.upper()
+
+    raise ValueError(f"BYTE operand must use C'..' or X'..': {operand}")
+
+
+def _parse_nonnegative_decimal(operand, directive):
+    if operand is None:
+        raise ValueError(f"{directive} requires an operand")
+    try:
+        value = int(operand, 10)
+    except ValueError as exc:
+        raise ValueError(f"{directive} requires a decimal integer: {operand}") from exc
+    if value < 0:
+        raise ValueError(f"{directive} operand must be non-negative: {operand}")
+    return value
+
+
 def run_pass1(asm_file, int_file, sym_file):
     csects = {}
     current_csect = ""
     locctr = 0
     start_address = 0
+    saw_end = False
+
+    def fail(line_number, message):
+        raise AssemblyError(message, phase="pass 1", line_number=line_number)
 
     with open(asm_file, 'r') as f_in, open(int_file, 'w') as f_out:
         lines = f_in.readlines()
         first_line = True
 
-        for line in lines:
+        for line_number, line in enumerate(lines, 1):
             label, opcode, operand, is_comment = parse_line(line)
 
             if is_comment:
                 continue
 
             if first_line and opcode == 'START':
-                start_address = int(operand, 16) if operand else 0
+                try:
+                    start_address = int(operand, 16) if operand else 0
+                except ValueError:
+                    fail(line_number, f"Invalid START address: {operand}")
+                if not 0 <= start_address <= 0xFFFFFF:
+                    fail(line_number, f"START address out of range: {operand}")
                 locctr = start_address
                 current_csect = label if label else "DEFAULT"
                 csects[current_csect] = {'symtab': {}, 'extdef': [], 'extref': [], 'length': 0}
@@ -75,12 +131,18 @@ def run_pass1(asm_file, int_file, sym_file):
             first_line = False
 
             if not current_csect:
-                current_csect = label if label else "DEFAULT"
+                current_csect = "DEFAULT"
                 csects[current_csect] = {'symtab': {}, 'extdef': [], 'extref': [], 'length': 0}
+
+            if opcode == 'START':
+                fail(line_number, "START must be the first non-comment statement")
 
             if opcode == 'CSECT':
                 csects[current_csect]['length'] = locctr
-                current_csect = label if label else "UNNAMED"
+                new_csect = label if label else "UNNAMED"
+                if new_csect in csects:
+                    fail(line_number, f"Duplicate control section: {new_csect}")
+                current_csect = new_csect
                 csects[current_csect] = {'symtab': {}, 'extdef': [], 'extref': [], 'length': 0}
                 locctr = 0
                 f_out.write(f"{locctr:04X}\t{line.strip()}\n")
@@ -89,45 +151,67 @@ def run_pass1(asm_file, int_file, sym_file):
             if opcode == 'END':
                 csects[current_csect]['length'] = locctr
                 f_out.write(f"\t\t{line.strip()}\n")
+                saw_end = True
                 break
 
             f_out.write(f"{locctr:04X}\t{line.strip()}\n")
 
             if opcode == 'EXTDEF':
-                if operand:
-                    csects[current_csect]['extdef'].extend([p.strip() for p in operand.split(',')])
+                if not operand:
+                    fail(line_number, "EXTDEF requires at least one symbol")
+                csects[current_csect]['extdef'].extend(
+                    [part.strip() for part in operand.split(',') if part.strip()]
+                )
                 continue
 
             if opcode == 'EXTREF':
-                if operand:
-                    csects[current_csect]['extref'].extend([p.strip() for p in operand.split(',')])
+                if not operand:
+                    fail(line_number, "EXTREF requires at least one symbol")
+                csects[current_csect]['extref'].extend(
+                    [part.strip() for part in operand.split(',') if part.strip()]
+                )
                 continue
 
             if label:
                 if label in csects[current_csect]['symtab']:
-                    print(f"Error: Duplicate label {label} in {current_csect}")
-                else:
-                    csects[current_csect]['symtab'][label] = locctr
+                    fail(line_number, f"Duplicate label {label} in {current_csect}")
+                csects[current_csect]['symtab'][label] = locctr
 
-            size = instruction_size(opcode) if opcode else None
+            try:
+                size = instruction_size(opcode) if opcode else None
+            except ValueError as exc:
+                fail(line_number, str(exc))
+
             if size is not None:
                 locctr += size
             elif opcode == 'WORD':
+                if operand is None:
+                    fail(line_number, "WORD requires an operand")
                 locctr += 3
             elif opcode == 'RESW':
-                locctr += 3 * int(operand)
+                try:
+                    locctr += 3 * _parse_nonnegative_decimal(operand, 'RESW')
+                except ValueError as exc:
+                    fail(line_number, str(exc))
             elif opcode == 'RESB':
-                locctr += int(operand)
+                try:
+                    locctr += _parse_nonnegative_decimal(operand, 'RESB')
+                except ValueError as exc:
+                    fail(line_number, str(exc))
             elif opcode == 'BYTE':
-                if operand.startswith("C'") and operand.endswith("'"):
-                    locctr += len(operand) - 3
-                elif operand.startswith("X'") and operand.endswith("'"):
-                    locctr += (len(operand) - 3) // 2
-            elif opcode in ['BASE', 'NOBASE', 'EQU']:
+                try:
+                    locctr += len(encode_byte_operand(operand)) // 2
+                except ValueError as exc:
+                    fail(line_number, str(exc))
+            elif opcode in ['BASE', 'NOBASE']:
                 pass
-            else:
-                if opcode:
-                    print(f"Error: Invalid opcode {opcode}")
+            elif opcode == 'EQU':
+                fail(line_number, "EQU expressions are not implemented")
+            elif opcode:
+                fail(line_number, f"Invalid opcode {opcode}")
+
+    if not saw_end:
+        raise AssemblyError("Missing END directive", phase="pass 1")
 
     with open(sym_file, 'w') as f_sym:
         for cs_name, cs_data in csects.items():
