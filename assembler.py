@@ -29,10 +29,10 @@ def main(argv=None):
     sym_file = f"{base_name}.sym"
     obj_file = f"{base_name}.obj"
     lst_file = f"{base_name}.lst"
-    final_outputs = [int_file, sym_file, obj_file, lst_file]
+    generated_outputs = [expanded_file, int_file, sym_file, obj_file, lst_file]
 
-    # Do not leave stale output from an earlier successful assembly if this run fails.
-    _remove_files(final_outputs)
+    # Do not leave stale or partially generated output from a failed assembly.
+    _remove_files(generated_outputs)
 
     try:
         print("Starting Macro Processor (Pass 0)...")
@@ -51,11 +51,11 @@ def main(argv=None):
         )
         return 0
     except AssemblyError as exc:
-        _remove_files(final_outputs)
+        _remove_files(generated_outputs)
         print(f"Assembly failed: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
-        _remove_files(final_outputs)
+        _remove_files(generated_outputs)
         print(f"Assembly failed: {exc}", file=sys.stderr)
         return 1
 
