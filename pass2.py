@@ -1,5 +1,6 @@
+from errors import AssemblyError
 from opcodes import FORMAT2_SIGNATURES, OPCODES, REGISTERS
-from pass1 import parse_line
+from pass1 import encode_byte_operand, parse_line
 
 
 def _parse_register(token):
@@ -52,8 +53,10 @@ def encode_format2(opcode, operand):
 def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
     base_register = -1
 
-    with open(int_file, 'r') as f_in, open(lst_file, 'w') as f_lst, open(obj_file, 'w') as f_obj:
+    def fail(line_number, message):
+        raise AssemblyError(message, phase="pass 2", line_number=line_number)
 
+    with open(int_file, 'r') as f_in, open(lst_file, 'w') as f_lst, open(obj_file, 'w') as f_obj:
         current_csect = ""
         text_record = ""
         text_start = -1
@@ -72,45 +75,40 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
             current_csect = name
             csect_len = csects[name]['length']
 
-            # H record
             name_str = (name + "      ")[:6]
             f_obj.write(f"H{name_str}{addr:06X}{csect_len:06X}\n")
 
-            # D record
             extdefs = csects[name]['extdef']
             if extdefs:
                 d_rec = "D"
-                for d in extdefs:
-                    if d in csects[name]['symtab']:
-                        d_addr = csects[name]['symtab'][d]
-                        d_rec += f"{d.ljust(6)[:6]}{d_addr:06X}"
+                for symbol in extdefs:
+                    if symbol in csects[name]['symtab']:
+                        d_addr = csects[name]['symtab'][symbol]
+                        d_rec += f"{symbol.ljust(6)[:6]}{d_addr:06X}"
                 f_obj.write(d_rec + "\n")
 
-            # R record
             extrefs = csects[name]['extref']
             if extrefs:
                 r_rec = "R"
-                for r in extrefs:
-                    r_rec += f"{r.ljust(6)[:6]}"
+                for symbol in extrefs:
+                    r_rec += f"{symbol.ljust(6)[:6]}"
                 f_obj.write(r_rec + "\n")
 
             mod_records = []
 
         def end_csect(write_e=False, exec_addr=None):
             flush_text_record()
-            for m in mod_records:
-                f_obj.write(f"{m}\n")
-            if write_e:
-                if exec_addr is not None:
-                    f_obj.write(f"E{exec_addr:06X}\n")
-                else:
-                    f_obj.write("E\n")
+            for record in mod_records:
+                f_obj.write(f"{record}\n")
+            if write_e and exec_addr is not None:
+                f_obj.write(f"E{exec_addr:06X}\n")
             else:
                 f_obj.write("E\n")
 
         lines = f_in.readlines()
 
         for idx, line in enumerate(lines):
+            line_number = idx + 1
             parts = line.strip('\n').split('\t', 1)
             if len(parts) != 2:
                 if "END" in line:
@@ -134,7 +132,6 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                     next_pc = int(next_parts[0].strip(), 16)
 
             label, opcode, operand, is_comment = parse_line(orig_line)
-
             if is_comment:
                 continue
 
@@ -160,17 +157,30 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                 end_csect(write_e=True, exec_addr=first_exec_addr)
                 break
 
-            if opcode in ['EXTDEF', 'EXTREF']:
+            if opcode == 'EXTDEF':
+                undefined = [
+                    symbol for symbol in csects[current_csect]['extdef']
+                    if symbol not in csects[current_csect]['symtab']
+                ]
+                if undefined:
+                    fail(line_number, f"EXTDEF symbol is not defined locally: {undefined[0]}")
+                f_lst.write(f"\t\t\t{orig_line}\n")
+                continue
+
+            if opcode == 'EXTREF':
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
 
             if opcode == 'BASE':
-                if operand in csects[current_csect]['symtab']:
-                    base_register = csects[current_csect]['symtab'][operand]
+                if not operand or operand not in csects[current_csect]['symtab']:
+                    fail(line_number, f"BASE requires a defined local symbol: {operand}")
+                base_register = csects[current_csect]['symtab'][operand]
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
 
             if opcode == 'NOBASE':
+                if operand:
+                    fail(line_number, "NOBASE does not take an operand")
                 base_register = -1
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
@@ -184,11 +194,14 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
 
                 if fmt == 1:
                     if operand:
-                        raise ValueError(f"{raw_opcode} does not take an operand")
+                        fail(line_number, f"{raw_opcode} does not take an operand")
                     obj_code = f"{op_val:02X}"
 
                 elif fmt == 2:
-                    operand_byte = encode_format2(raw_opcode, operand)
+                    try:
+                        operand_byte = encode_format2(raw_opcode, operand)
+                    except ValueError as exc:
+                        fail(line_number, str(exc))
                     obj_code = f"{op_val:02X}{operand_byte:02X}"
 
                 elif fmt == 3:
@@ -199,7 +212,10 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                         e = 1
 
                     if not operand:
-                        pass
+                        if raw_opcode != 'RSUB':
+                            fail(line_number, f"{raw_opcode} requires an operand")
+                    elif raw_opcode == 'RSUB':
+                        fail(line_number, "RSUB does not take an operand")
                     else:
                         op_symbol = operand
                         if operand.startswith('#'):
@@ -210,8 +226,10 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                             op_symbol = operand[1:]
 
                         if op_symbol.endswith(',X'):
+                            if (n, i) != (1, 1):
+                                fail(line_number, "Indexed addressing cannot be combined with # or @")
                             x = 1
-                            op_symbol = op_symbol[:-2]
+                            op_symbol = op_symbol[:-2].strip()
 
                         target_addr = 0
                         is_absolute = False
@@ -220,7 +238,10 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                         if op_symbol.startswith('*'):
                             offset = 0
                             if len(op_symbol) > 1:
-                                offset = int(op_symbol[1:])
+                                try:
+                                    offset = int(op_symbol[1:])
+                                except ValueError:
+                                    fail(line_number, f"Invalid location-counter expression: {op_symbol}")
                             target_addr = next_pc + offset
                         elif op_symbol.isdigit() or (
                             op_symbol.startswith('-') and op_symbol[1:].isdigit()
@@ -233,10 +254,20 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                             is_extref = True
                             target_addr = 0
                         else:
-                            print(f"Error: Undefined symbol {op_symbol} in CSECT {current_csect}")
+                            fail(
+                                line_number,
+                                f"Undefined symbol {op_symbol} in CSECT {current_csect}",
+                            )
 
                         if is_absolute:
-                            disp = target_addr
+                            if e:
+                                if not -(1 << 19) <= target_addr <= 0xFFFFF:
+                                    fail(line_number, f"Format-4 constant out of 20-bit range: {target_addr}")
+                                disp = target_addr & 0xFFFFF
+                            else:
+                                if not -2048 <= target_addr <= 4095:
+                                    fail(line_number, f"Format-3 constant out of 12-bit range: {target_addr}")
+                                disp = target_addr & 0xFFF
                         elif is_extref:
                             if e == 1:
                                 disp = 0
@@ -244,11 +275,14 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                     f"M{current_pc + 1:06X}05+{op_symbol.ljust(6)[:6]}"
                                 )
                             else:
-                                print(
-                                    f"Error: External reference {op_symbol} must be used with Format 4"
+                                fail(
+                                    line_number,
+                                    f"External reference {op_symbol} requires Format 4",
                                 )
                         else:
                             if e == 1:
+                                if not 0 <= target_addr <= 0xFFFFF:
+                                    fail(line_number, f"Format-4 address out of range: {target_addr}")
                                 disp = target_addr
                                 mod_records.append(
                                     f"M{current_pc + 1:06X}05+{current_csect.ljust(6)[:6]}"
@@ -264,12 +298,14 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                         b = 1
                                         disp = disp_val & 0xFFF
                                     else:
-                                        print(
-                                            f"Error: Displacement out of bounds for {opcode} {operand}"
+                                        fail(
+                                            line_number,
+                                            f"Displacement out of bounds for {opcode} {operand}",
                                         )
                                 else:
-                                    print(
-                                        f"Error: Displacement out of bounds and NOBASE for {opcode} {operand}"
+                                    fail(
+                                        line_number,
+                                        f"Displacement out of bounds and BASE is not set for {opcode} {operand}",
                                     )
 
                     byte1 = (op_val & 0xFC) | (n << 1) | i
@@ -288,19 +324,20 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                     mod_records.append(f"M{current_pc:06X}06+{operand.ljust(6)[:6]}")
                 else:
                     try:
-                        val = int(operand)
-                    except ValueError:
-                        print(f"Error: Unsupported WORD operand {operand}")
+                        val = int(operand, 10)
+                    except (TypeError, ValueError):
+                        fail(line_number, f"Unsupported WORD operand {operand}")
+                if not -(1 << 23) <= val <= 0xFFFFFF:
+                    fail(line_number, f"WORD value out of 24-bit range: {val}")
                 if val < 0:
                     val = (1 << 24) + val
                 obj_code = f"{val:06X}"
 
             elif opcode == 'BYTE':
-                if operand.startswith("C'") and operand.endswith("'"):
-                    chars = operand[2:-1]
-                    obj_code = "".join(f"{ord(c):02X}" for c in chars)
-                elif operand.startswith("X'") and operand.endswith("'"):
-                    obj_code = operand[2:-1]
+                try:
+                    obj_code = encode_byte_operand(operand)
+                except ValueError as exc:
+                    fail(line_number, str(exc))
 
             elif opcode in ['RESW', 'RESB']:
                 pass
