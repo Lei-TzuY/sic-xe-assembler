@@ -59,6 +59,6 @@ def evaluate_expression(expression, current_location, symtab, relocatable_symbol
             base_text in relocatable_symbols,
         )
     else:
-        raise ValueError(f"Undefined symbol in expression: {base_text}")
+        raise ValueError(f"Undefined symbol {base_text}")
 
     return ExpressionValue(base.value + offset, base.relocatable)
