@@ -67,18 +67,23 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
         first_csect = next(iter(csects))
         first_data = csects[first_csect]
         execution_address = first_data['start']
-        end_line_number = None
+        end_error = None
 
         for idx, source_line in enumerate(lines):
             parts = source_line.strip('\n').split('\t', 1)
             original = parts[1] if len(parts) == 2 else source_line
             _, opcode, operand, is_comment = parse_line(original)
             if not is_comment and opcode == 'END':
-                end_line_number = idx + 1
                 if operand:
-                    if operand not in first_data['symtab']:
-                        fail(end_line_number, f"END execution symbol is not defined in {first_csect}: {operand}")
-                    execution_address = first_data['symtab'][operand]
+                    if operand == first_csect:
+                        execution_address = first_data['start']
+                    elif operand in first_data['symtab']:
+                        execution_address = first_data['symtab'][operand]
+                    else:
+                        end_error = (
+                            idx + 1,
+                            f"END execution symbol is not defined in {first_csect}: {operand}",
+                        )
                 break
 
         def flush_text_record():
@@ -142,6 +147,8 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
             parts = line.strip('\n').split('\t', 1)
             if len(parts) != 2:
                 if "END" in line:
+                    if end_error is not None:
+                        fail(*end_error)
                     f_lst.write(f"\t\t\t{line.strip()}\n")
                     end_csect()
                     break
@@ -170,6 +177,8 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                 continue
 
             if opcode == 'END':
+                if end_error is not None:
+                    fail(*end_error)
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 end_csect()
                 break
