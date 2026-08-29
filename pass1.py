@@ -1,4 +1,5 @@
 from errors import AssemblyError
+from expressions import evaluate_expression
 from opcodes import DIRECTIVES, OPCODES
 
 
@@ -27,8 +28,6 @@ def parse_line(line):
         raw = token[1:] if token.startswith('+') else token
         return raw in OPCODES or token in DIRECTIVES
 
-    # Indentation convention disambiguates an unknown opcode from a label, so
-    # malformed instructions such as "    BADOP VALUE" get useful diagnostics.
     if is_opcode(first) or had_leading_whitespace:
         return None, first, remainder or None, False
 
@@ -94,37 +93,22 @@ def _parse_nonnegative_decimal(operand, directive):
     return value
 
 
-def _evaluate_equ(operand, locctr, symtab):
-    """Evaluate the simple absolute EQU forms supported by this assembler."""
-    if not operand:
-        raise ValueError("EQU requires an expression")
+def _new_csect(start):
+    return {
+        'symtab': {},
+        'relocatable': set(),
+        'extdef': [],
+        'extref': [],
+        'start': start,
+        'length': 0,
+    }
 
-    expression = operand.strip()
-    if expression == '*':
-        return locctr
 
-    if expression.startswith('*'):
-        if len(expression) < 3 or expression[1] not in '+-':
-            raise ValueError(f"Unsupported EQU expression: {expression}")
-        try:
-            offset = int(expression[2:], 10)
-        except ValueError as exc:
-            raise ValueError(f"Unsupported EQU expression: {expression}") from exc
-        return locctr + offset if expression[1] == '+' else locctr - offset
-
-    if expression in symtab:
-        return symtab[expression]
-
-    try:
-        value = int(expression, 16) if expression.lower().startswith('0x') else int(expression, 10)
-    except ValueError as exc:
-        raise ValueError(
-            f"EQU requires *, *+n, *-n, a defined symbol, or an integer: {expression}"
-        ) from exc
-
-    if not 0 <= value <= 0xFFFFFF:
-        raise ValueError(f"EQU value out of range: {value}")
-    return value
+def _finish_csect(csect, locctr):
+    length = locctr - csect['start']
+    if length < 0:
+        raise ValueError("Location counter moved before control-section start")
+    csect['length'] = length
 
 
 def run_pass1(asm_file, int_file, sym_file):
@@ -143,7 +127,6 @@ def run_pass1(asm_file, int_file, sym_file):
 
         for line_number, line in enumerate(lines, 1):
             label, opcode, operand, is_comment = parse_line(line)
-
             if is_comment:
                 continue
 
@@ -156,7 +139,7 @@ def run_pass1(asm_file, int_file, sym_file):
                     fail(line_number, f"START address out of range: {operand}")
                 locctr = start_address
                 current_csect = label if label else "DEFAULT"
-                csects[current_csect] = {'symtab': {}, 'extdef': [], 'extref': [], 'length': 0}
+                csects[current_csect] = _new_csect(start_address)
                 f_out.write(f"{locctr:04X}\t{line.strip()}\n")
                 first_line = False
                 continue
@@ -165,68 +148,81 @@ def run_pass1(asm_file, int_file, sym_file):
 
             if not current_csect:
                 current_csect = "DEFAULT"
-                csects[current_csect] = {'symtab': {}, 'extdef': [], 'extref': [], 'length': 0}
+                csects[current_csect] = _new_csect(0)
 
             if opcode == 'START':
                 fail(line_number, "START must be the first non-comment statement")
 
             if opcode == 'CSECT':
-                csects[current_csect]['length'] = locctr
+                try:
+                    _finish_csect(csects[current_csect], locctr)
+                except ValueError as exc:
+                    fail(line_number, str(exc))
                 new_csect = label if label else "UNNAMED"
                 if new_csect in csects:
                     fail(line_number, f"Duplicate control section: {new_csect}")
                 current_csect = new_csect
-                csects[current_csect] = {'symtab': {}, 'extdef': [], 'extref': [], 'length': 0}
+                csects[current_csect] = _new_csect(0)
                 locctr = 0
                 f_out.write(f"{locctr:04X}\t{line.strip()}\n")
                 continue
 
             if opcode == 'END':
-                csects[current_csect]['length'] = locctr
+                try:
+                    _finish_csect(csects[current_csect], locctr)
+                except ValueError as exc:
+                    fail(line_number, str(exc))
                 f_out.write(f"\t\t{line.strip()}\n")
                 saw_end = True
                 break
 
             f_out.write(f"{locctr:04X}\t{line.strip()}\n")
+            csect = csects[current_csect]
 
             if opcode == 'EXTDEF':
                 if not operand:
                     fail(line_number, "EXTDEF requires at least one symbol")
-                csects[current_csect]['extdef'].extend(
-                    [part.strip() for part in operand.split(',') if part.strip()]
-                )
+                symbols = [part.strip() for part in operand.split(',')]
+                if any(not symbol for symbol in symbols):
+                    fail(line_number, "EXTDEF contains an empty symbol")
+                csect['extdef'].extend(symbols)
                 continue
 
             if opcode == 'EXTREF':
                 if not operand:
                     fail(line_number, "EXTREF requires at least one symbol")
-                csects[current_csect]['extref'].extend(
-                    [part.strip() for part in operand.split(',') if part.strip()]
-                )
+                symbols = [part.strip() for part in operand.split(',')]
+                if any(not symbol for symbol in symbols):
+                    fail(line_number, "EXTREF contains an empty symbol")
+                csect['extref'].extend(symbols)
                 continue
 
             if opcode == 'EQU':
                 if not label:
                     fail(line_number, "EQU requires a label")
-                if label in csects[current_csect]['symtab']:
+                if label in csect['symtab']:
                     fail(line_number, f"Duplicate label {label} in {current_csect}")
                 try:
-                    value = _evaluate_equ(
+                    result = evaluate_expression(
                         operand,
                         locctr,
-                        csects[current_csect]['symtab'],
+                        csect['symtab'],
+                        csect['relocatable'],
                     )
                 except ValueError as exc:
                     fail(line_number, str(exc))
-                if not 0 <= value <= 0xFFFFFF:
-                    fail(line_number, f"EQU value out of range: {value}")
-                csects[current_csect]['symtab'][label] = value
+                if not 0 <= result.value <= 0xFFFFFF:
+                    fail(line_number, f"EQU value out of range: {result.value}")
+                csect['symtab'][label] = result.value
+                if result.relocatable:
+                    csect['relocatable'].add(label)
                 continue
 
             if label:
-                if label in csects[current_csect]['symtab']:
+                if label in csect['symtab']:
                     fail(line_number, f"Duplicate label {label} in {current_csect}")
-                csects[current_csect]['symtab'][label] = locctr
+                csect['symtab'][label] = locctr
+                csect['relocatable'].add(label)
 
             try:
                 size = instruction_size(opcode) if opcode else None
@@ -258,6 +254,9 @@ def run_pass1(asm_file, int_file, sym_file):
                 pass
             elif opcode:
                 fail(line_number, f"Invalid opcode {opcode}")
+
+            if locctr > 0x1000000:
+                fail(line_number, "Location counter exceeds 24-bit address space")
 
     if not saw_end:
         raise AssemblyError("Missing END directive", phase="pass 1")
