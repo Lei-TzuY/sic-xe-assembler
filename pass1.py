@@ -94,6 +94,39 @@ def _parse_nonnegative_decimal(operand, directive):
     return value
 
 
+def _evaluate_equ(operand, locctr, symtab):
+    """Evaluate the simple absolute EQU forms supported by this assembler."""
+    if not operand:
+        raise ValueError("EQU requires an expression")
+
+    expression = operand.strip()
+    if expression == '*':
+        return locctr
+
+    if expression.startswith('*'):
+        if len(expression) < 3 or expression[1] not in '+-':
+            raise ValueError(f"Unsupported EQU expression: {expression}")
+        try:
+            offset = int(expression[2:], 10)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported EQU expression: {expression}") from exc
+        return locctr + offset if expression[1] == '+' else locctr - offset
+
+    if expression in symtab:
+        return symtab[expression]
+
+    try:
+        value = int(expression, 16) if expression.lower().startswith('0x') else int(expression, 10)
+    except ValueError as exc:
+        raise ValueError(
+            f"EQU requires *, *+n, *-n, a defined symbol, or an integer: {expression}"
+        ) from exc
+
+    if not 0 <= value <= 0xFFFFFF:
+        raise ValueError(f"EQU value out of range: {value}")
+    return value
+
+
 def run_pass1(asm_file, int_file, sym_file):
     csects = {}
     current_csect = ""
@@ -172,6 +205,24 @@ def run_pass1(asm_file, int_file, sym_file):
                 )
                 continue
 
+            if opcode == 'EQU':
+                if not label:
+                    fail(line_number, "EQU requires a label")
+                if label in csects[current_csect]['symtab']:
+                    fail(line_number, f"Duplicate label {label} in {current_csect}")
+                try:
+                    value = _evaluate_equ(
+                        operand,
+                        locctr,
+                        csects[current_csect]['symtab'],
+                    )
+                except ValueError as exc:
+                    fail(line_number, str(exc))
+                if not 0 <= value <= 0xFFFFFF:
+                    fail(line_number, f"EQU value out of range: {value}")
+                csects[current_csect]['symtab'][label] = value
+                continue
+
             if label:
                 if label in csects[current_csect]['symtab']:
                     fail(line_number, f"Duplicate label {label} in {current_csect}")
@@ -205,8 +256,6 @@ def run_pass1(asm_file, int_file, sym_file):
                     fail(line_number, str(exc))
             elif opcode in ['BASE', 'NOBASE']:
                 pass
-            elif opcode == 'EQU':
-                fail(line_number, "EQU expressions are not implemented")
             elif opcode:
                 fail(line_number, f"Invalid opcode {opcode}")
 
