@@ -62,6 +62,19 @@ def _addressing_prefix(n, i):
     return "?"
 
 
+def _byte_fallback(raw, address, warning):
+    first = raw[0]
+    return DecodedInstruction(
+        address=address,
+        size=1,
+        data=raw[:1],
+        mnemonic=".BYTE",
+        operand=f"X'{first:02X}'",
+        format=0,
+        warning=warning,
+    )
+
+
 def decode_instruction(data, address=0, base_register=None):
     """Decode one SIC/XE instruction from the beginning of *data*.
 
@@ -86,14 +99,10 @@ def decode_instruction(data, address=0, base_register=None):
                 format=1,
             )
         if len(raw) < 2:
-            return DecodedInstruction(
-                address=address,
-                size=1,
-                data=raw[:1],
-                mnemonic=".BYTE",
-                operand=f"X'{first:02X}'",
-                format=0,
-                warning=f"truncated format-2 instruction {mnemonic}",
+            return _byte_fallback(
+                raw,
+                address,
+                f"truncated format-2 instruction {mnemonic}",
             )
         return DecodedInstruction(
             address=address,
@@ -107,56 +116,65 @@ def decode_instruction(data, address=0, base_register=None):
     opcode = first & 0xFC
     decoded = _OPCODE_BY_BYTE.get(opcode)
     if decoded is None or decoded[1] != 3:
-        return DecodedInstruction(
-            address=address,
-            size=1,
-            data=raw[:1],
-            mnemonic=".BYTE",
-            operand=f"X'{first:02X}'",
-            format=0,
-            warning="unknown opcode",
-        )
+        return _byte_fallback(raw, address, "unknown opcode")
 
     mnemonic, _ = decoded
     if len(raw) < 3:
-        return DecodedInstruction(
-            address=address,
-            size=1,
-            data=raw[:1],
-            mnemonic=".BYTE",
-            operand=f"X'{first:02X}'",
-            format=0,
-            warning=f"truncated format-3 instruction {mnemonic}",
+        return _byte_fallback(
+            raw,
+            address,
+            f"truncated format-3 instruction {mnemonic}",
         )
 
     n = (first >> 1) & 1
     i = first & 1
     second = raw[1]
     x = (second >> 7) & 1
+
+    # n=i=0 selects original SIC compatibility encoding. In this mode the
+    # lower 15 address bits are not XE b/p/e flags and the instruction is
+    # always exactly three bytes long.
+    if (n, i) == (0, 0):
+        target = ((second & 0x7F) << 8) | raw[2]
+        operand = _format_target(target)
+        if x:
+            operand += ",X"
+        return DecodedInstruction(
+            address=address,
+            size=3,
+            data=raw[:3],
+            mnemonic=mnemonic,
+            operand=operand,
+            format=3,
+            flags=f"00{x}---",
+            target=target,
+            warning="SIC compatibility mode",
+        )
+
     b = (second >> 6) & 1
     p = (second >> 5) & 1
     e = (second >> 4) & 1
     size = 4 if e else 3
     if len(raw) < size:
-        return DecodedInstruction(
-            address=address,
-            size=1,
-            data=raw[:1],
-            mnemonic=".BYTE",
-            operand=f"X'{first:02X}'",
-            format=0,
-            warning=f"truncated format-{size} instruction {mnemonic}",
+        return _byte_fallback(
+            raw,
+            address,
+            f"truncated format-{size} instruction {mnemonic}",
         )
 
     flags = f"{n}{i}{x}{b}{p}{e}"
     prefix = _addressing_prefix(n, i)
-    warning = None
+    warnings = []
+    if b and p:
+        warnings.append("both base-relative and PC-relative flags are set")
+    if x and (n, i) != (1, 1):
+        warnings.append("indexed flag used with non-simple addressing")
 
     if e:
         field = ((second & 0x0F) << 16) | (raw[2] << 8) | raw[3]
         target = field
         if b or p:
-            warning = "format-4 instruction has b/p set"
+            warnings.append("format-4 instruction has b/p set")
         operand = prefix + _format_target(field)
         mnemonic_text = "+" + mnemonic
     else:
@@ -192,7 +210,7 @@ def decode_instruction(data, address=0, base_register=None):
         format=size,
         flags=flags,
         target=target,
-        warning=warning,
+        warning="; ".join(warnings) if warnings else None,
     )
 
 
