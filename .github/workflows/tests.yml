@@ -24,7 +24,10 @@ jobs:
       - name: Compile check
         run: python -m compileall -q .
       - name: Unified CLI smoke
-        run: python sicxe.py --help
+        run: |
+          python sicxe.py --help
+          python sicxe.py inspect --help
+          python sicxe.py disasm --help
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Verify byte-for-byte golden fixtures
