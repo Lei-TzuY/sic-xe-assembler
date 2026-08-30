@@ -1,5 +1,5 @@
 from errors import AssemblyError
-from expressions import evaluate_expression
+from expressions import evaluate_expression, evaluate_link_expression
 from opcodes import FORMAT2_SIGNATURES, OPCODES, REGISTERS
 from pass1 import encode_byte_operand, parse_line, parse_literal
 
@@ -142,6 +142,19 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
             else:
                 f_obj.write("E\n")
 
+        def append_link_modifications(address, half_bytes, result):
+            if result.local_relocation_factor:
+                sign = '+' if result.local_relocation_factor > 0 else '-'
+                for _ in range(abs(result.local_relocation_factor)):
+                    mod_records.append(
+                        f"M{address:06X}{half_bytes:02X}{sign}{current_csect.ljust(6)[:6]}"
+                    )
+            for term_sign, symbol in result.external_terms:
+                sign = '+' if term_sign > 0 else '-'
+                mod_records.append(
+                    f"M{address:06X}{half_bytes:02X}{sign}{symbol.ljust(6)[:6]}"
+                )
+
         for idx, line in enumerate(lines):
             line_number = idx + 1
             parts = line.strip('\n').split('\t', 1)
@@ -203,18 +216,22 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
             if opcode == 'BASE':
                 if not operand:
                     fail(line_number, "BASE requires an operand")
-                if operand in data['extref']:
-                    fail(line_number, f"BASE cannot use an external reference: {operand}")
                 try:
-                    result = evaluate_expression(
+                    result = evaluate_link_expression(
                         operand,
                         current_pc,
+                        csect_start,
                         data['symtab'],
                         data['relocatable'],
+                        data['extref'],
                     )
                 except ValueError as exc:
                     fail(line_number, str(exc))
-                base_register = result.value
+                if result.external_terms:
+                    fail(line_number, f"BASE cannot use an external reference expression: {operand}")
+                base_register = result.value + (
+                    csect_start if result.local_relocation_factor == 1 else 0
+                )
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
 
@@ -278,10 +295,6 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                             x = 1
                             op_symbol = op_symbol[:-2].strip()
 
-                        is_extref = op_symbol in data['extref']
-                        target_addr = 0
-                        relocatable = False
-
                         if op_symbol.startswith('='):
                             try:
                                 canonical, _ = parse_literal(op_symbol)
@@ -291,42 +304,7 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                             if entry is None or entry['address'] is None:
                                 fail(line_number, f"Literal is not assigned in {current_csect}: {op_symbol}")
                             target_addr = entry['address']
-                            relocatable = True
-                            is_extref = False
-                        elif is_extref:
-                            target_addr = 0
-                        else:
-                            try:
-                                result = evaluate_expression(
-                                    op_symbol,
-                                    current_pc,
-                                    data['symtab'],
-                                    data['relocatable'],
-                                )
-                            except ValueError as exc:
-                                fail(line_number, str(exc))
-                            target_addr = result.value
-                            relocatable = result.relocatable
-
-                        if is_extref:
-                            if e == 1:
-                                disp = 0
-                                mod_records.append(
-                                    f"M{current_pc + 1:06X}05+{op_symbol.ljust(6)[:6]}"
-                                )
-                            else:
-                                fail(line_number, f"External reference {op_symbol} requires Format 4")
-                        elif not relocatable:
                             if e:
-                                if not -(1 << 19) <= target_addr <= 0xFFFFF:
-                                    fail(line_number, f"Format-4 constant out of 20-bit range: {target_addr}")
-                                disp = target_addr & 0xFFFFF
-                            else:
-                                if not -2048 <= target_addr <= 4095:
-                                    fail(line_number, f"Format-3 constant out of 12-bit range: {target_addr}")
-                                disp = target_addr & 0xFFF
-                        else:
-                            if e == 1:
                                 relative = target_addr - csect_start
                                 if not 0 <= relative <= 0xFFFFF:
                                     fail(line_number, f"Format-4 relocatable address out of range: {target_addr}")
@@ -351,6 +329,66 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                         line_number,
                                         f"Displacement out of bounds and BASE is not set for {opcode} {operand}",
                                     )
+                        else:
+                            try:
+                                link_result = evaluate_link_expression(
+                                    op_symbol,
+                                    current_pc,
+                                    csect_start,
+                                    data['symtab'],
+                                    data['relocatable'],
+                                    data['extref'],
+                                )
+                            except ValueError as exc:
+                                fail(line_number, str(exc))
+
+                            if e:
+                                if not -(1 << 19) <= link_result.value <= 0xFFFFF:
+                                    fail(
+                                        line_number,
+                                        f"Format-4 expression value out of 20-bit range: {link_result.value}",
+                                    )
+                                disp = link_result.value & 0xFFFFF
+                                append_link_modifications(
+                                    current_pc + 1,
+                                    5,
+                                    link_result,
+                                )
+                            else:
+                                if link_result.external_terms:
+                                    fail(
+                                        line_number,
+                                        f"External expression requires Format 4: {op_symbol}",
+                                    )
+                                if link_result.local_relocation_factor == 0:
+                                    target_addr = link_result.value
+                                    if not -2048 <= target_addr <= 4095:
+                                        fail(
+                                            line_number,
+                                            f"Format-3 constant out of 12-bit range: {target_addr}",
+                                        )
+                                    disp = target_addr & 0xFFF
+                                else:
+                                    target_addr = link_result.value + csect_start
+                                    disp_val = target_addr - next_pc
+                                    if -2048 <= disp_val <= 2047:
+                                        p = 1
+                                        disp = disp_val & 0xFFF
+                                    elif base_register != -1:
+                                        disp_val = target_addr - base_register
+                                        if 0 <= disp_val <= 4095:
+                                            b = 1
+                                            disp = disp_val & 0xFFF
+                                        else:
+                                            fail(
+                                                line_number,
+                                                f"Displacement out of bounds for {opcode} {operand}",
+                                            )
+                                    else:
+                                        fail(
+                                            line_number,
+                                            f"Displacement out of bounds and BASE is not set for {opcode} {operand}",
+                                        )
 
                     byte1 = (op_val & 0xFC) | (n << 1) | i
                     byte2 = (x << 7) | (b << 6) | (p << 5) | (e << 4)
@@ -363,26 +401,20 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                         obj_code = f"{byte1:02X}{byte2:02X}{disp & 0xFF:02X}"
 
             elif opcode == 'WORD':
-                if operand in data['extref']:
-                    value = 0
-                    mod_records.append(f"M{current_pc:06X}06+{operand.ljust(6)[:6]}")
-                else:
-                    try:
-                        result = evaluate_expression(
-                            operand,
-                            current_pc,
-                            data['symtab'],
-                            data['relocatable'],
-                        )
-                    except ValueError as exc:
-                        fail(line_number, str(exc))
-                    if result.relocatable:
-                        value = result.value - csect_start
-                        mod_records.append(
-                            f"M{current_pc:06X}06+{current_csect.ljust(6)[:6]}"
-                        )
-                    else:
-                        value = result.value
+                try:
+                    result = evaluate_link_expression(
+                        operand,
+                        current_pc,
+                        csect_start,
+                        data['symtab'],
+                        data['relocatable'],
+                        data['extref'],
+                    )
+                except ValueError as exc:
+                    fail(line_number, str(exc))
+
+                value = result.value
+                append_link_modifications(current_pc, 6, result)
 
                 if not -(1 << 23) <= value <= 0xFFFFFF:
                     fail(line_number, f"WORD value out of 24-bit range: {value}")
