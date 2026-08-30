@@ -16,6 +16,13 @@ class LinkExpressionValue:
     external_terms: tuple
 
 
+@dataclass(frozen=True)
+class _AlgebraValue:
+    value: int
+    relocation_factor: int = 0
+    external_terms: tuple = ()
+
+
 def parse_integer(token):
     text = token.strip()
     if text.lower().startswith('0x'):
@@ -27,80 +34,188 @@ def parse_integer(token):
     return int(text, 10)
 
 
-def _split_terms(expression):
-    """Split a simple SIC/XE additive expression into signed terms."""
-    text = ''.join(expression.split())
-    if not text:
-        raise ValueError("Expression is required")
-
-    terms = []
+def _tokenize(expression):
+    text = expression or ""
+    tokens = []
     index = 0
-    sign = 1
-    if text[0] in '+-':
-        sign = -1 if text[0] == '-' else 1
-        index = 1
-        if index == len(text):
-            raise ValueError(f"Missing term in expression: {expression}")
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char in "+-*/()":
+            tokens.append(char)
+            index += 1
+            continue
+        if char.isdigit():
+            start = index
+            if text.startswith(("0x", "0X"), index):
+                index += 2
+                hex_start = index
+                while index < len(text) and text[index] in "0123456789abcdefABCDEF":
+                    index += 1
+                if index == hex_start:
+                    raise ValueError(f"Invalid hexadecimal integer in expression: {expression}")
+            else:
+                while index < len(text) and text[index].isdigit():
+                    index += 1
+            tokens.append(text[start:index])
+            continue
+        if char.isalpha() or char in "_$":
+            start = index
+            index += 1
+            while index < len(text) and (text[index].isalnum() or text[index] in "_$"):
+                index += 1
+            tokens.append(text[start:index])
+            continue
+        raise ValueError(f"Invalid character {char!r} in expression: {expression}")
 
-    start = index
-    while index <= len(text):
-        if index == len(text) or text[index] in '+-':
-            token = text[start:index]
-            if not token:
-                raise ValueError(f"Missing term in expression: {expression}")
-            terms.append((sign, token))
-            if index == len(text):
-                break
-            sign = -1 if text[index] == '-' else 1
-            start = index + 1
-        index += 1
-
-    return terms
+    if not tokens:
+        raise ValueError("Expression is required")
+    return tuple(tokens)
 
 
-def _resolve_term(token, current_location, symtab, relocatable_symbols):
-    if token == '*':
-        return current_location, 1
+def _combine_additive(left, right, sign):
+    return _AlgebraValue(
+        value=left.value + sign * right.value,
+        relocation_factor=left.relocation_factor + sign * right.relocation_factor,
+        external_terms=left.external_terms
+        + tuple((term_sign * sign, symbol) for term_sign, symbol in right.external_terms),
+    )
 
-    try:
-        return parse_integer(token), 0
-    except ValueError:
-        pass
 
-    if token not in symtab:
-        raise ValueError(f"Undefined symbol {token}")
+def _negate(value):
+    return _AlgebraValue(
+        value=-value.value,
+        relocation_factor=-value.relocation_factor,
+        external_terms=tuple((-sign, symbol) for sign, symbol in value.external_terms),
+    )
 
-    return symtab[token], 1 if token in relocatable_symbols else 0
+
+def _require_absolute_binary(left, right, operator):
+    if (
+        left.relocation_factor != 0
+        or right.relocation_factor != 0
+        or left.external_terms
+        or right.external_terms
+    ):
+        raise ValueError(
+            f"Operator {operator} requires absolute operands; relocatable/external terms cannot be multiplied or divided"
+        )
+
+
+def _truncating_division(left, right):
+    if right == 0:
+        raise ValueError("Division by zero in expression")
+    quotient = abs(left) // abs(right)
+    return -quotient if (left < 0) != (right < 0) else quotient
+
+
+class _ExpressionParser:
+    def __init__(self, expression, resolve_primary):
+        self.expression = expression
+        self.tokens = _tokenize(expression)
+        self.index = 0
+        self.resolve_primary = resolve_primary
+
+    def _peek(self):
+        if self.index >= len(self.tokens):
+            return None
+        return self.tokens[self.index]
+
+    def _take(self):
+        token = self._peek()
+        if token is not None:
+            self.index += 1
+        return token
+
+    def parse(self):
+        result = self._parse_additive()
+        extra = self._peek()
+        if extra is not None:
+            raise ValueError(
+                f"Unexpected token {extra!r} in expression: {self.expression}"
+            )
+        return result
+
+    def _parse_additive(self):
+        value = self._parse_multiplicative()
+        while self._peek() in ("+", "-"):
+            operator = self._take()
+            right = self._parse_multiplicative()
+            value = _combine_additive(value, right, 1 if operator == "+" else -1)
+        return value
+
+    def _parse_multiplicative(self):
+        value = self._parse_unary()
+        while self._peek() in ("*", "/"):
+            operator = self._take()
+            right = self._parse_unary()
+            _require_absolute_binary(value, right, operator)
+            if operator == "*":
+                value = _AlgebraValue(value.value * right.value)
+            else:
+                value = _AlgebraValue(_truncating_division(value.value, right.value))
+        return value
+
+    def _parse_unary(self):
+        token = self._peek()
+        if token in ("+", "-"):
+            self._take()
+            value = self._parse_unary()
+            return value if token == "+" else _negate(value)
+        return self._parse_primary()
+
+    def _parse_primary(self):
+        token = self._take()
+        if token is None:
+            raise ValueError(f"Missing term in expression: {self.expression}")
+        if token == "(":
+            value = self._parse_additive()
+            if self._take() != ")":
+                raise ValueError(f"Missing ')' in expression: {self.expression}")
+            return value
+        if token == ")":
+            raise ValueError(f"Unexpected ')' in expression: {self.expression}")
+        if token in ("+", "-", "/"):
+            raise ValueError(f"Missing term before {token!r} in expression: {self.expression}")
+        return self.resolve_primary(token)
+
+
+def _evaluate(expression, resolve_primary):
+    return _ExpressionParser(expression, resolve_primary).parse()
 
 
 def evaluate_expression(expression, current_location, symtab, relocatable_symbols):
-    """Evaluate additive local SIC/XE expressions and enforce relocation algebra.
+    """Evaluate local SIC/XE expressions with precedence and relocation algebra.
 
-    Absolute terms contribute no relocation factor; relocatable symbols and `*`
-    contribute +1 or -1 according to their sign. A final relocation factor of 0
-    is absolute and +1 is relocatable. Any other factor is illegal.
+    Supported syntax includes parentheses, unary +/- and binary +, -, *, /.  The
+    multiplicative operators are intentionally restricted to absolute operands;
+    relocatable terms may only participate in additive algebra. Division uses
+    integer truncation toward zero.
     """
-    if not expression:
-        raise ValueError("Expression is required")
+    relocatable_symbols = set(relocatable_symbols)
 
-    value = 0
-    relocation_factor = 0
-    for sign, token in _split_terms(expression):
-        term_value, term_factor = _resolve_term(
-            token,
-            current_location,
-            symtab,
-            relocatable_symbols,
+    def resolve(token):
+        if token == '*':
+            return _AlgebraValue(current_location, 1)
+        try:
+            return _AlgebraValue(parse_integer(token))
+        except ValueError:
+            pass
+        if token not in symtab:
+            raise ValueError(f"Undefined symbol {token}")
+        return _AlgebraValue(
+            symtab[token],
+            1 if token in relocatable_symbols else 0,
         )
-        value += sign * term_value
-        relocation_factor += sign * term_factor
 
-    if relocation_factor not in (0, 1):
+    result = _evaluate(expression, resolve)
+    if result.relocation_factor not in (0, 1):
         raise ValueError(
-            f"Illegal relocatable expression (relative term balance {relocation_factor}): {expression}"
+            f"Illegal relocatable expression (relative term balance {result.relocation_factor}): {expression}"
         )
-
-    return ExpressionValue(value, relocation_factor == 1)
+    return ExpressionValue(result.value, result.relocation_factor == 1)
 
 
 def evaluate_link_expression(
@@ -111,50 +226,39 @@ def evaluate_link_expression(
     relocatable_symbols,
     external_symbols,
 ):
-    """Evaluate an additive expression for a relocatable object-code field.
+    """Evaluate a relocatable object-field expression with full additive syntax.
 
-    Local relocatable terms are stored section-relative and represented by a
-    relocation factor for the current control section. External symbols
-    contribute zero to the initial field and are returned as signed linker
-    modification terms. Purely local expressions retain the normal SIC/XE
-    legality rule (relative balance must be 0 or +1).
+    Local relocatable values are represented section-relative plus a current-
+    section relocation factor. External symbols are represented as signed M
+    terms. Parentheses and unary signs may rearrange additive terms, while * and
+    / remain absolute-only so object records never need scaled relocation terms.
     """
-    if not expression:
-        raise ValueError("Expression is required")
-
+    relocatable_symbols = set(relocatable_symbols)
     external_symbols = set(external_symbols)
-    value = 0
-    local_factor = 0
-    external_terms = []
 
-    for sign, token in _split_terms(expression):
+    def resolve(token):
         if token in external_symbols:
-            external_terms.append((sign, token))
-            continue
-
+            return _AlgebraValue(0, 0, ((1, token),))
         if token == '*':
-            value += sign * (current_location - csect_start)
-            local_factor += sign
-            continue
-
+            return _AlgebraValue(current_location - csect_start, 1)
         try:
-            value += sign * parse_integer(token)
-            continue
+            return _AlgebraValue(parse_integer(token))
         except ValueError:
             pass
-
         if token not in symtab:
             raise ValueError(f"Undefined symbol {token}")
-
         if token in relocatable_symbols:
-            value += sign * (symtab[token] - csect_start)
-            local_factor += sign
-        else:
-            value += sign * symtab[token]
+            return _AlgebraValue(symtab[token] - csect_start, 1)
+        return _AlgebraValue(symtab[token])
 
-    if not external_terms and local_factor not in (0, 1):
+    result = _evaluate(expression, resolve)
+    if not result.external_terms and result.relocation_factor not in (0, 1):
         raise ValueError(
-            f"Illegal relocatable expression (relative term balance {local_factor}): {expression}"
+            f"Illegal relocatable expression (relative term balance {result.relocation_factor}): {expression}"
         )
 
-    return LinkExpressionValue(value, local_factor, tuple(external_terms))
+    return LinkExpressionValue(
+        result.value,
+        result.relocation_factor,
+        tuple(result.external_terms),
+    )
