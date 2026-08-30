@@ -82,7 +82,6 @@ class SourceMapTests(unittest.TestCase):
         self.assertIn("BUF", section["regions"][3]["symbols"])
         self.assertTrue(any(symbol["name"] == "VALUE" for symbol in section["symbols"]))
 
-        # The sidecar is bound to the exact canonical object bytes.
         object_sha = hashlib.sha256(obj.read_bytes()).hexdigest()
         load_source_map(map_path, object_sha256=object_sha)
 
@@ -110,7 +109,7 @@ class SourceMapTests(unittest.TestCase):
         self.assertIn(".RESB 8", text)
         self.assertIn(".LITERAL X'FF'", text)
         self.assertIn("target_symbol=FIRST", text)
-        self.assertNotIn("01000  ", text)  # source addresses were rebased
+        self.assertNotIn("01000  ", text)
 
     def test_stale_source_map_causes_fail_closed_link_and_cleans_artifacts(self):
         _, source = self.make_program()
@@ -126,7 +125,7 @@ class SourceMapTests(unittest.TestCase):
 
         result = self.run_script(LOADER, obj, "4000")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("source map", result.stderr.lower())
+        self.assertIn("source-map", result.stderr.lower())
         for suffix in (".map", ".bin", ".manifest.json", ".debug.json"):
             self.assertFalse(source.with_suffix(suffix).exists())
 
