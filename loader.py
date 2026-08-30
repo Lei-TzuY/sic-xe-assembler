@@ -4,6 +4,11 @@ from pathlib import Path
 
 from address_space import SICXE_MEMORY_SIZE
 from link_map import default_map_path, write_link_map
+from linked_image import (
+    default_image_path,
+    default_manifest_path,
+    write_linked_image_artifacts,
+)
 from load_plan import (
     LoadPlanError,
     build_estab,
@@ -189,11 +194,12 @@ def dump_memory(memory, start_addr, length):
     print("=" * 65 + "\n")
 
 
-def _remove_stale_map(path):
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
+def _remove_stale_artifacts(paths):
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def main():
@@ -219,24 +225,38 @@ def main():
         return 1
 
     map_path = default_map_path(obj_files)
-    _remove_stale_map(map_path)
+    image_path = default_image_path(obj_files)
+    manifest_path = default_manifest_path(obj_files)
+    artifact_paths = (map_path, image_path, manifest_path)
+    _remove_stale_artifacts(artifact_paths)
 
     try:
         print(f"Capturing {len(obj_files)} object files for reproducible link...")
         session = _as_loader_error(capture_link_session, obj_files)
         print(f"Planning at PROGADDR {progaddr:05X}...")
         plan = _as_loader_error(build_load_plan, session, progaddr)
+
+        # Materialize first. Persistent artifacts are emitted only after the
+        # complete validated plan has produced the exact final image bytes.
+        memory, exec_addr = apply_load_plan(plan)
+        written_image, written_manifest = write_linked_image_artifacts(
+            plan,
+            memory,
+            image_path,
+            manifest_path,
+        )
         write_link_map(plan, map_path)
+
+        print(f"Linked image written: {written_image}")
+        print(f"Image manifest written: {written_manifest}")
         print(f"Link map written: {map_path}")
         print_load_map(plan)
         print_estab(plan.estab)
-
-        memory, exec_addr = apply_load_plan(plan)
         print(f"Load complete. Execution start address: {exec_addr:05X}\n")
         dump_memory(memory, progaddr, plan.total_length)
         return 0
     except (LoaderError, OSError, ValueError) as exc:
-        _remove_stale_map(map_path)
+        _remove_stale_artifacts(artifact_paths)
         print(f"Load failed: {exc}", file=sys.stderr)
         return 1
 
