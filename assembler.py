@@ -55,7 +55,7 @@ def main(argv=None):
 
     try:
         print("Starting Macro Processor (Pass 0)...")
-        run_macro_processor(asm_file, expanded_file)
+        macro_trace = run_macro_processor(asm_file, expanded_file)
         print(f"Macro Processor completed. Generated: {expanded_file}")
 
         print("Validating object-program contracts...")
@@ -88,6 +88,8 @@ def main(argv=None):
             csects,
             parse_line,
             source_map_file,
+            original_source_path=asm_file,
+            macro_trace=macro_trace,
         )
         print(
             f"Pass 2 completed. Outputs generated: "
