@@ -102,6 +102,8 @@ MIX      WORD    FIRST+EXT1-EXT2
 
 For `DIFF`, the initial WORD value is `5`, followed by `+EXT1` and `-EXT2` modification records. `MIX` additionally emits a `+<current CSECT>` modification for the local relocatable `FIRST` term. Format-3 instructions reject expressions containing external symbols because they cannot be resolved with 12-bit PC/base-relative addressing, and `BASE` likewise rejects external expressions.
 
+Relocatable object addends have an explicit interpretation so the loader never has to guess signedness: a 5-half-byte format-4 relocation field uses an unsigned 20-bit addend, while a 6-half-byte `WORD` relocation field uses a signed 24-bit two's-complement addend. The assembler rejects relocatable expressions that cannot be represented by those pre-link addend contracts.
+
 ## Run the loader
 
 ```powershell
@@ -111,6 +113,8 @@ python loader.py program.obj 4000
 Object programs retain their assembled control-section origin. The loader translates H/T/M/E record addresses to the requested `PROGADDR`, so sources with a non-zero `START` address relocate correctly instead of being loaded at `PROGADDR + START`.
 
 The loader allocates the full 1 MiB SIC/XE memory space. Before ESTAB construction or memory mutation, it validates the complete section semantics: H ranges must stay within 20-bit machine memory; D offsets may denote the one-past-end location but not beyond it; T records may arrive out of address order but may not overlap; every M field must lie inside the section, be fully backed by loaded T bytes, and name either the current control section or a symbol declared by R; execution addresses are end-exclusive for non-empty sections. `PROGADDR` and the aggregate placement of every linked control section are also range-checked before loading. Across all linked inputs only one explicit execution address is accepted, preventing later object files from silently overriding the program entry point.
+
+Repeated M records that target the same field are treated as one relocation expression: all signed ESTAB deltas are summed using exact integers, the final 20-bit or 24-bit value is range-checked once, and only then is the field written. This prevents silent modular wraparound and makes the result independent of M-record order. Partially overlapping modification fields, or mixed 5/6-half-byte fields over the same bytes, are rejected as ambiguous.
 
 ## Verify the checked-in fixtures
 
@@ -122,4 +126,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, 20-bit machine-address placement, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, 20-bit machine-address placement, exact grouped relocation arithmetic, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
