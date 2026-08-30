@@ -151,7 +151,7 @@ class OrgDirectiveTests(unittest.TestCase):
             source = Path(temp_name) / "bad.asm"
             source.write_text(source_text, encoding="utf-8")
             result = subprocess.run(
-                [sys.executable, str(ASSEMBER), str(source)],
+                [sys.executable, str(ASSEMBLER), str(source)],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
