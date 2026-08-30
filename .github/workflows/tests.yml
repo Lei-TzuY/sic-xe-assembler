@@ -28,6 +28,7 @@ jobs:
           python sicxe.py --help
           python sicxe.py inspect --help
           python sicxe.py disasm --help
+          python sicxe.py cfg --help
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Verify byte-for-byte golden fixtures
