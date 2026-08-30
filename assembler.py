@@ -1,6 +1,10 @@
 import os
 import sys
 
+from assembler_address_space import (
+    validate_finalized_csect_ranges,
+    validate_source_start_address,
+)
 from assembler_semantics import (
     validate_generated_object_semantics,
     validate_initialized_storage,
@@ -47,9 +51,11 @@ def main(argv=None):
 
         print("Validating object-program contracts...")
         validate_source_object_contracts(expanded_file, parse_line)
+        validate_source_start_address(expanded_file, parse_line)
 
         print("Starting Pass 1...")
         csects, start_addr = run_pass1(expanded_file, int_file, sym_file)
+        validate_finalized_csect_ranges(csects)
         validate_initialized_storage(expanded_file, int_file, parse_line)
         print(f"Pass 1 completed. Found {len(csects)} CSECT(s).")
 
