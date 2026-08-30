@@ -1,6 +1,6 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, external definitions/references, relocation records, literal pools, expression algebra, `ORG`, and a linking loader.
+A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, `ORG`, and a linking loader.
 
 ## Run the assembler
 
@@ -24,6 +24,24 @@ $LOOP    LDA     &TARGET
 ```
 
 Two `SPIN` invocations receive different expanded `$LOOP` symbols. Missing/extra arguments, duplicate or undeclared parameters, unexpected `MEND`, and unterminated definitions are hard assembly errors.
+
+## Program blocks
+
+`USE` switches among independent location counters inside one control section. The unnamed default block is laid out first; named blocks follow in first-seen order. Pass 1 records block-relative locations and rebases symbols, literals, and intermediate addresses only after all block lengths are known.
+
+```asm
+COPY     START   1000
+FIRST    LDA     TABLE
+         USE     DATA
+TABLE    RESW    16
+         USE     CODE
+ROUTINE  RSUB
+         USE
+NEXT     WORD    TABLE-FIRST
+         END     FIRST
+```
+
+`USE DATA` and `USE CODE` preserve the previous location of each block, while operand-less `USE` returns to the default block. Source order therefore does not need to match final memory order. Labels on a `USE` statement bind to the current block before the switch. Literal pools emitted by `LTORG` are placed in whichever block is active at that point. Each program block also owns an independent `ORG` restore stack.
 
 ## Literal pools
 
@@ -53,7 +71,7 @@ FIELD    RESW    1
          ORG
 ```
 
-`ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. Control-section length uses the highest location reached, so moving LOCCTR backward cannot truncate the H-record length.
+`ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. With program blocks, `ORG` must resolve within the currently active block. Block length uses the highest location reached, so moving LOCCTR backward cannot truncate the final block or H-record length.
 
 ## External relocation expressions
 
@@ -86,4 +104,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including signed external modification terms, `ORG`, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
