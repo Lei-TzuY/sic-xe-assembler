@@ -68,6 +68,15 @@ class LinkedImageArtifactTests(unittest.TestCase):
         self.assertEqual(manifest["entry"]["section"], "MAIN")
         self.assertEqual(manifest["entry"]["source_address"], 0)
 
+    def test_manifest_rejects_bytes_not_matching_planned_image_length(self):
+        path = self.write_object(self.relocatable_object())
+        plan = build_load_plan([path], 0x4000)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Linked image length does not match validated load plan",
+        ):
+            build_image_manifest(plan, b"\x00")
+
     def test_manifest_and_binary_are_path_independent_and_reproducible(self):
         first_dir = self.make_temp_dir("sicxe-image-first-")
         second_dir = self.make_temp_dir("sicxe-image-second-")
