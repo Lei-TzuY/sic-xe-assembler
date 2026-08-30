@@ -213,6 +213,20 @@ def _reachable_addresses(entry_address, nodes, edges):
     return seen
 
 
+def _is_block_graph_edge(edge, include_calls=True):
+    source = edge.get("source_block")
+    target = edge.get("target_block")
+    if not edge.get("resolved") or source is None or target is None:
+        return False
+    if not include_calls and edge.get("kind") == "call":
+        return False
+    # Ordinary sequential fallthroughs inside one basic block are instruction
+    # edges, not basic-block graph edges. Explicit branch/jump self-loops remain.
+    if source == target and edge.get("kind") == "fallthrough":
+        return False
+    return True
+
+
 def _build_blocks(entry_address, nodes, edges, reachable):
     by_address = {node["address"]: node for node in nodes}
     leaders = set()
@@ -284,10 +298,10 @@ def _build_blocks(entry_address, nodes, edges, reachable):
 
     by_block = {block["id"]: block for block in blocks}
     for edge in edges:
-        source_block = edge.get("source_block")
-        target_block = edge.get("target_block")
-        if not edge.get("resolved") or source_block is None or target_block is None:
+        if not _is_block_graph_edge(edge):
             continue
+        source_block = edge["source_block"]
+        target_block = edge["target_block"]
         if target_block not in by_block[source_block]["successors"]:
             by_block[source_block]["successors"].append(target_block)
         if source_block not in by_block[target_block]["predecessors"]:
@@ -306,9 +320,11 @@ def _compute_dominators(entry_address, blocks, address_to_block, edges):
 
     predecessors = {block_id: set() for block_id in reachable_blocks}
     for edge in edges:
-        source = edge.get("source_block")
-        target = edge.get("target_block")
-        if edge.get("resolved") and source in reachable_blocks and target in reachable_blocks:
+        if not _is_block_graph_edge(edge):
+            continue
+        source = edge["source_block"]
+        target = edge["target_block"]
+        if source in reachable_blocks and target in reachable_blocks:
             predecessors[target].add(source)
 
     dominators = {}
@@ -342,24 +358,18 @@ def _compute_dominators(entry_address, blocks, address_to_block, edges):
 def _natural_loops(blocks, edges, dominators):
     predecessors = {block["id"]: set() for block in blocks}
     for edge in edges:
-        source = edge.get("source_block")
-        target = edge.get("target_block")
-        if edge.get("resolved") and edge.get("kind") != "call" and source is not None and target is not None:
-            predecessors[target].add(source)
+        if not _is_block_graph_edge(edge, include_calls=False):
+            continue
+        predecessors[edge["target_block"]].add(edge["source_block"])
 
     back_edges = []
     loops = []
     for edge in edges:
-        source = edge.get("source_block")
-        target = edge.get("target_block")
-        if (
-            not edge.get("resolved")
-            or edge.get("kind") == "call"
-            or source is None
-            or target is None
-            or source not in dominators
-            or target not in dominators[source]
-        ):
+        if not _is_block_graph_edge(edge, include_calls=False):
+            continue
+        source = edge["source_block"]
+        target = edge["target_block"]
+        if source not in dominators or target not in dominators[source]:
             continue
         back_edges.append({
             "source_block": source,
@@ -414,14 +424,11 @@ def _graph_metrics(blocks, edges, nodes, loops):
     reachable_blocks = {block["id"] for block in blocks if block["reachable"]}
     intraprocedural_edges = []
     for edge in edges:
-        source = edge.get("source_block")
-        target = edge.get("target_block")
-        if (
-            edge.get("resolved")
-            and edge.get("kind") != "call"
-            and source in reachable_blocks
-            and target in reachable_blocks
-        ):
+        if not _is_block_graph_edge(edge, include_calls=False):
+            continue
+        source = edge["source_block"]
+        target = edge["target_block"]
+        if source in reachable_blocks and target in reachable_blocks:
             intraprocedural_edges.append((source, target, edge["kind"]))
     unique_edges = sorted(set(intraprocedural_edges))
     weak_edges = {(source, target) for source, target, _ in unique_edges}
@@ -626,6 +633,8 @@ def render_control_flow_dot(report):
         source = edge.get("source_block")
         target = edge.get("target_block")
         if source is None or target is None:
+            continue
+        if source == target and edge.get("kind") == "fallthrough":
             continue
         key = (source, target, edge["kind"])
         if key in seen:
