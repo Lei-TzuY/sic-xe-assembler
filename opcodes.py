@@ -67,7 +67,7 @@ OPCODES = {
 
 DIRECTIVES = {
     'START', 'END', 'WORD', 'BYTE', 'RESW', 'RESB', 'BASE', 'NOBASE',
-    'MACRO', 'MEND', 'CSECT', 'EXTDEF', 'EXTREF', 'EQU', 'LTORG'
+    'MACRO', 'MEND', 'CSECT', 'EXTDEF', 'EXTREF', 'EQU', 'LTORG', 'ORG'
 }
 
 REGISTERS = {
