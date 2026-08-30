@@ -1,6 +1,4 @@
-import tempfile
 import unittest
-from pathlib import Path
 
 from control_flow import analyze_control_flow
 
@@ -57,8 +55,9 @@ class ControlFlowBoundaryTests(unittest.TestCase):
         self.assertFalse(nodes[0x4003]["reachable"])
 
     def test_indirect_jump_is_not_fabricated_as_static_edge(self):
-        # J @04006 followed by a typed instruction at 04006. The encoded address
-        # points at an indirect pointer location, not a statically known PC target.
+        # J @00006 is followed by another typed instruction at 04003. The
+        # encoded field identifies an indirect pointer address, not a statically
+        # known instruction target, so no direct CFG edge may be fabricated.
         image = bytes.fromhex("3E00064F0000")
         debug = {
             "sections": [
