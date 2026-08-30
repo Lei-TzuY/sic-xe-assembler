@@ -1,4 +1,7 @@
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import MappingProxyType
 
 from address_space import validate_machine_address, validate_machine_range
 from loader_semantics import analyze_object_records
@@ -11,6 +14,25 @@ from relocation import (
 
 class LoadPlanError(ValueError):
     """Raised when linked inputs cannot form one deterministic load plan."""
+
+
+@dataclass(frozen=True)
+class ObjectInputSnapshot:
+    file_path: str
+    canonical_path: str
+    input_index: int
+    byte_length: int
+    sha256: str
+    records: tuple
+    raw_bytes: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class LinkSession:
+    """Immutable ordered snapshots for one reproducible link invocation."""
+
+    inputs: tuple
+    input_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -48,27 +70,105 @@ class PlannedSection:
 class LoadPlan:
     progaddr: int
     sections: tuple
-    estab: dict
-    symbol_sources: dict
+    estab: object
+    symbol_sources: object
     execution_address: int
     execution_source: object
     total_length: int
+    inputs: tuple
+    input_fingerprint: str
+    link_fingerprint: str
 
 
-def _read_sections(filepath):
-    records = []
+def _digest_link_inputs(inputs):
+    """Return an order-sensitive, path-independent digest of raw input content."""
+    digest = hashlib.sha256()
+    digest.update(b"SICXE-LINK-INPUTS-v1\0")
+    for snapshot in inputs:
+        digest.update(snapshot.input_index.to_bytes(8, "big"))
+        digest.update(snapshot.byte_length.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(snapshot.sha256))
+    return digest.hexdigest()
+
+
+def _digest_link_plan(session, progaddr):
+    digest = hashlib.sha256()
+    digest.update(b"SICXE-LINK-PLAN-v1\0")
+    digest.update(progaddr.to_bytes(4, "big"))
+    digest.update(bytes.fromhex(session.input_fingerprint))
+    return digest.hexdigest()
+
+
+def capture_link_session(obj_files):
+    """Read each object file exactly once and freeze the bytes for this link."""
+    snapshots = []
+    for input_index, filepath in enumerate(obj_files):
+        path = Path(filepath)
+        file_path = str(filepath)
+        try:
+            raw_bytes = path.read_bytes()
+        except OSError as exc:
+            raise LoadPlanError(str(exc)) from exc
+
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LoadPlanError(
+                f"Object program is not valid UTF-8: {file_path}"
+            ) from exc
+
+        snapshots.append(
+            ObjectInputSnapshot(
+                file_path=file_path,
+                canonical_path=str(path.resolve()),
+                input_index=input_index,
+                byte_length=len(raw_bytes),
+                sha256=hashlib.sha256(raw_bytes).hexdigest(),
+                records=tuple(
+                    line for line in text.splitlines() if line.strip()
+                ),
+                raw_bytes=raw_bytes,
+            )
+        )
+
+    inputs = tuple(snapshots)
+    return LinkSession(
+        inputs=inputs,
+        input_fingerprint=_digest_link_inputs(inputs),
+    )
+
+
+def verify_link_session(session):
+    """Optionally prove that on-disk inputs still match a captured session."""
+    for snapshot in session.inputs:
+        try:
+            current = Path(snapshot.canonical_path).read_bytes()
+        except OSError as exc:
+            raise LoadPlanError(
+                f"Object input is no longer readable: {snapshot.file_path}: {exc}"
+            ) from exc
+        actual = hashlib.sha256(current).hexdigest()
+        if actual != snapshot.sha256:
+            raise LoadPlanError(
+                f"Object input changed since snapshot: {snapshot.file_path}; "
+                f"expected sha256={snapshot.sha256}, actual sha256={actual}"
+            )
+    return session
+
+
+def _coerce_session(obj_files_or_session):
+    if isinstance(obj_files_or_session, LinkSession):
+        return obj_files_or_session
+    return capture_link_session(obj_files_or_session)
+
+
+def _analyze_snapshot(snapshot):
     try:
-        with open(filepath, 'r') as object_file:
-            for line in object_file:
-                if line.strip():
-                    records.append(line.rstrip('\n'))
-    except OSError as exc:
-        raise LoadPlanError(str(exc)) from exc
-
-    try:
-        return analyze_object_records(records)
+        return analyze_object_records(snapshot.records)
     except ValueError as exc:
-        raise LoadPlanError(f"Invalid object program {filepath}: {exc}") from exc
+        raise LoadPlanError(
+            f"Invalid object program {snapshot.file_path}: {exc}"
+        ) from exc
 
 
 def _validate_progaddr(progaddr):
@@ -105,16 +205,16 @@ def _add_external_symbol(estab, sources, name, value, source):
     sources[name] = source
 
 
-def _collect_inputs(obj_files, progaddr):
+def _collect_inputs(obj_files_or_session, progaddr):
     _validate_progaddr(progaddr)
+    session = _coerce_session(obj_files_or_session)
     parsed = []
     estab = {}
     sources = {}
     load_address = progaddr
 
-    for input_index, filepath in enumerate(obj_files):
-        file_path = str(filepath)
-        sections = _read_sections(filepath)
+    for snapshot in session.inputs:
+        sections = _analyze_snapshot(snapshot)
         for section_index, section in enumerate(sections):
             _validate_section_placement(
                 load_address,
@@ -127,7 +227,7 @@ def _collect_inputs(obj_files, progaddr):
                 sources,
                 section['name'],
                 load_address,
-                _definition_source(file_path, section['name']),
+                _definition_source(snapshot.file_path, section['name']),
             )
             for symbol, offset in section['definitions']:
                 _add_external_symbol(
@@ -135,29 +235,32 @@ def _collect_inputs(obj_files, progaddr):
                     sources,
                     symbol,
                     load_address + offset,
-                    _definition_source(file_path, section['name'], symbol),
+                    _definition_source(
+                        snapshot.file_path,
+                        section['name'],
+                        symbol,
+                    ),
                 )
 
             parsed.append({
-                'file_path': file_path,
-                'input_index': input_index,
+                'file_path': snapshot.file_path,
+                'input_index': snapshot.input_index,
                 'section_index': section_index,
                 'section': section,
                 'load_address': load_address,
             })
             load_address += section['length']
 
-    return parsed, estab, sources
+    return parsed, estab, sources, session
 
 
-def build_estab(obj_files, progaddr):
+def build_estab(obj_files_or_session, progaddr):
     """Build placement + ESTAB without evaluating relocation arithmetic.
 
-    This preserves the traditional loader Pass-1 boundary while sharing the
-    exact same parsing, placement, and duplicate-definition rules as the full
-    load-plan builder.
+    A LinkSession may be supplied to guarantee that Pass 1 and later planning
+    consume the exact same captured object bytes.
     """
-    _, estab, _ = _collect_inputs(obj_files, progaddr)
+    _, estab, _, _ = _collect_inputs(obj_files_or_session, progaddr)
     return estab
 
 
@@ -240,20 +343,32 @@ def _plan_relocations(item, estab):
                 relocated=relocated,
                 encoded=encoded,
                 symbols=tuple(symbols),
-                records=tuple(modification['record'] for modification in group),
+                records=tuple(
+                    modification['record'] for modification in group
+                ),
             )
         )
 
-    # R declarations that do not participate in any M expression are legal.
-    # Retain them as deterministic plan metadata instead of treating them as an
-    # error: producers may intentionally emit a superset of link references.
     unused = tuple(sorted(set(section['references']) - used_symbols))
     return tuple(planned), unused
 
 
-def build_load_plan(obj_files, progaddr):
+def _freeze_text(text):
+    return MappingProxyType({
+        'address': text['address'],
+        'offset': text['offset'],
+        'length': text['length'],
+        'data': bytes(text['data']),
+        'record': text['record'],
+    })
+
+
+def build_load_plan(obj_files_or_session, progaddr):
     """Resolve and validate every link-time decision before memory mutation."""
-    parsed, estab, sources = _collect_inputs(obj_files, progaddr)
+    parsed, estab, sources, session = _collect_inputs(
+        obj_files_or_session,
+        progaddr,
+    )
 
     explicit_entries = []
     planned_sections = []
@@ -264,7 +379,9 @@ def build_load_plan(obj_files, progaddr):
         source_exec = section['execution_address']
         loaded_exec = None
         if source_exec is not None:
-            loaded_exec = item['load_address'] + (source_exec - section['start'])
+            loaded_exec = item['load_address'] + (
+                source_exec - section['start']
+            )
             explicit_entries.append((loaded_exec, item, source_exec))
 
         planned_sections.append(
@@ -278,7 +395,7 @@ def build_load_plan(obj_files, progaddr):
                 load_address=item['load_address'],
                 definitions=tuple(section['definitions']),
                 references=tuple(sorted(section['references'])),
-                texts=tuple(section['texts']),
+                texts=tuple(_freeze_text(text) for text in section['texts']),
                 relocations=relocations,
                 unused_references=unused_references,
                 source_execution_address=source_exec,
@@ -311,9 +428,12 @@ def build_load_plan(obj_files, progaddr):
     return LoadPlan(
         progaddr=progaddr,
         sections=tuple(planned_sections),
-        estab=dict(estab),
-        symbol_sources=dict(sources),
+        estab=MappingProxyType(dict(estab)),
+        symbol_sources=MappingProxyType(dict(sources)),
         execution_address=execution_address,
         execution_source=execution_source,
         total_length=total_length,
+        inputs=session.inputs,
+        input_fingerprint=session.input_fingerprint,
+        link_fingerprint=_digest_link_plan(session, progaddr),
     )
