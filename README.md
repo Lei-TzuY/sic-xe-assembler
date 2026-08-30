@@ -14,6 +14,10 @@ Object-program names used by control sections, `EXTDEF`, and `EXTREF` must fit t
 
 After Pass 1 has assigned final program-block addresses, the assembler checks initialized storage for overlap. Instructions, `WORD`, `BYTE`, and emitted literal bytes may not overwrite earlier initialized bytes, even after `ORG` moves LOCCTR backward. `RESB`/`RESW` remain reservations rather than initialized storage, so the conventional pattern of using `ORG` to define fields inside a reserved buffer remains valid. After Pass 2, the generated object file is also run through the same semantic analyzer used by the loader; an object file that the loader would reject can therefore never be reported as a successful assembly.
 
+## Address-space model
+
+SIC/XE machine memory is 20-bit: `0x00000`–`0xFFFFF` (1 MiB). The six hexadecimal digits used by H/D/T/M/E records are a 24-bit **serialization field**, not a 16 MiB machine-memory declaration. `START`, finalized control-section placement, loader `PROGADDR`, and linked-image placement all obey the 20-bit machine limit, while 24-bit `WORD` data remains independent. See [`docs/address-space.md`](docs/address-space.md) for the precise contract, including one-past-end boundary symbols.
+
 ## Macro processor
 
 Macros use positional `&NAME` parameters and are validated before expansion. Arguments may contain quoted commas, macro bodies may invoke other macros, and recursive expansion is rejected. Labels beginning with `$` are macro-local and are rewritten to deterministic unique symbols for each expansion, so repeated invocations do not create duplicate assembler labels.
@@ -106,7 +110,7 @@ python loader.py program.obj 4000
 
 Object programs retain their assembled control-section origin. The loader translates H/T/M/E record addresses to the requested `PROGADDR`, so sources with a non-zero `START` address relocate correctly instead of being loaded at `PROGADDR + START`.
 
-Before ESTAB construction or memory mutation, the loader validates the complete section semantics: H ranges must stay within 24-bit source space; D offsets may denote the one-past-end location but not beyond it; T records may arrive out of address order but may not overlap; every M field must lie inside the section, be fully backed by loaded T bytes, and name either the current control section or a symbol declared by R; execution addresses are end-exclusive for non-empty sections. Across all linked inputs only one explicit execution address is accepted, preventing later object files from silently overriding the program entry point.
+The loader allocates the full 1 MiB SIC/XE memory space. Before ESTAB construction or memory mutation, it validates the complete section semantics: H ranges must stay within 20-bit machine memory; D offsets may denote the one-past-end location but not beyond it; T records may arrive out of address order but may not overlap; every M field must lie inside the section, be fully backed by loaded T bytes, and name either the current control section or a symbol declared by R; execution addresses are end-exclusive for non-empty sections. `PROGADDR` and the aggregate placement of every linked control section are also range-checked before loading. Across all linked inputs only one explicit execution address is accepted, preventing later object files from silently overriding the program entry point.
 
 ## Verify the checked-in fixtures
 
@@ -118,4 +122,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, 20-bit machine-address placement, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
