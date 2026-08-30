@@ -93,6 +93,16 @@ def _static_control_target(node):
     return target, None
 
 
+def _same_section(left, right):
+    return (
+        left["input_index"],
+        left["section_index"],
+    ) == (
+        right["input_index"],
+        right["section_index"],
+    )
+
+
 def _instruction_edges(nodes):
     by_address = {node["address"]: node for node in nodes}
     edges = []
@@ -109,7 +119,12 @@ def _instruction_edges(nodes):
 
     for node in nodes:
         mnemonic = node["base_mnemonic"]
-        fallthrough = node["end"] if node["end"] in by_address else None
+        candidate = by_address.get(node["end"])
+        fallthrough = (
+            node["end"]
+            if candidate is not None and _same_section(node, candidate)
+            else None
+        )
 
         if mnemonic in UNCONDITIONAL_BRANCHES:
             target, reason = _static_control_target(node)
