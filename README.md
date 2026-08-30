@@ -116,6 +116,8 @@ The loader allocates the full 1 MiB SIC/XE memory space. Before ESTAB constructi
 
 Repeated M records that target the same field are treated as one relocation expression: all signed ESTAB deltas are summed using exact integers, the final 20-bit or 24-bit value is range-checked once, and only then is the field written. This prevents silent modular wraparound and makes the result independent of M-record order. Partially overlapping modification fields, or mixed 5/6-half-byte fields over the same bytes, are rejected as ambiguous.
 
+Before allocating or mutating SIC/XE memory, the loader now builds one deterministic **load plan** for all input files. The plan fixes every control-section placement, the complete ESTAB with definition provenance, every relocation result, unused-but-legal R declaration, and the final execution entry point. Undefined external symbols, duplicate definitions, ambiguous multiple entry points, relocation range failures, and stale/tampered ESTABs therefore fail before loading begins. The CLI prints this validated load map before materializing memory. See [`docs/load-plan.md`](docs/load-plan.md) for the plan contract.
+
 ## Verify the checked-in fixtures
 
 ```powershell
@@ -126,4 +128,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, 20-bit machine-address placement, exact grouped relocation arithmetic, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, 20-bit machine-address placement, exact grouped relocation arithmetic, deterministic link/load planning, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
