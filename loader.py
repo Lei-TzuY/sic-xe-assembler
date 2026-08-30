@@ -1,14 +1,28 @@
 import os
 import sys
+from pathlib import Path
 
 from address_space import SICXE_MEMORY_SIZE
 from link_map import default_map_path, write_link_map
-from load_plan import LoadPlanError, build_estab, build_load_plan
+from load_plan import (
+    LoadPlanError,
+    build_estab,
+    build_load_plan,
+    capture_link_session,
+)
 from loader_semantics import analyze_object_records
 
 
 class LoaderError(Exception):
     pass
+
+
+class SessionEstab(dict):
+    """ESTAB compatible with dict, plus the immutable Pass-1 input session."""
+
+    def __init__(self, values, link_session):
+        super().__init__(values)
+        self.link_session = link_session
 
 
 def _load_object(filepath):
@@ -38,8 +52,10 @@ def _as_loader_error(callable_, *args):
 
 
 def pass1(obj_files, progaddr):
-    """Traditional loader Pass 1: placement and ESTAB construction."""
-    return _as_loader_error(build_estab, obj_files, progaddr)
+    """Traditional Pass 1, with an immutable input snapshot bound to ESTAB."""
+    session = _as_loader_error(capture_link_session, obj_files)
+    estab = _as_loader_error(build_estab, session, progaddr)
+    return SessionEstab(estab, session)
 
 
 def _estab_mismatch(expected, actual):
@@ -57,12 +73,23 @@ def _estab_mismatch(expected, actual):
     return "unknown mismatch"
 
 
+def _session_input_mismatch(session, obj_files):
+    expected = tuple(snapshot.canonical_path for snapshot in session.inputs)
+    actual = tuple(str(Path(filepath).resolve()) for filepath in obj_files)
+    if expected == actual:
+        return None
+    return (
+        "object input list does not match Pass-1 snapshot: "
+        f"expected {expected}, received {actual}"
+    )
+
+
 def apply_load_plan(plan):
     """Materialize one fully validated plan into SIC/XE memory.
 
-    All parsing, placement, symbol resolution, entry-point selection, and exact
-    relocation arithmetic have already succeeded before this function allocates
-    and mutates memory.
+    All parsing, placement, symbol resolution, entry-point selection, exact
+    relocation arithmetic, and input capture have already succeeded before
+    this function allocates and mutates memory.
     """
     memory = bytearray(SICXE_MEMORY_SIZE)
 
@@ -82,9 +109,20 @@ def apply_load_plan(plan):
 
 
 def pass2(obj_files, progaddr, estab):
-    """Validate a complete load plan before performing any memory mutation."""
-    plan = _as_loader_error(build_load_plan, obj_files, progaddr)
-    if dict(estab) != plan.estab:
+    """Plan and load from the exact Pass-1 snapshot when one is available."""
+    if isinstance(estab, SessionEstab):
+        mismatch = _session_input_mismatch(estab.link_session, obj_files)
+        if mismatch is not None:
+            raise LoaderError(mismatch)
+        session = estab.link_session
+    else:
+        # Compatibility path for callers that intentionally pass a plain dict.
+        # Such callers have discarded the Pass-1 snapshot, so capture the
+        # current files once and still perform the complete load-plan preflight.
+        session = _as_loader_error(capture_link_session, obj_files)
+
+    plan = _as_loader_error(build_load_plan, session, progaddr)
+    if dict(estab) != dict(plan.estab):
         raise LoaderError(
             "ESTAB does not match validated load plan: "
             + _estab_mismatch(plan.estab, dict(estab))
@@ -107,6 +145,8 @@ def print_load_map(plan):
     print("=" * 65)
     print("Validated Load Plan")
     print("-" * 65)
+    print(f"Input fingerprint: {plan.input_fingerprint}")
+    print(f"Link fingerprint:  {plan.link_fingerprint}")
     for section in plan.sections:
         end = section.load_address + section.length
         print(
@@ -182,8 +222,10 @@ def main():
     _remove_stale_map(map_path)
 
     try:
-        print(f"Planning {len(obj_files)} object files at PROGADDR {progaddr:05X}...")
-        plan = _as_loader_error(build_load_plan, obj_files, progaddr)
+        print(f"Capturing {len(obj_files)} object files for reproducible link...")
+        session = _as_loader_error(capture_link_session, obj_files)
+        print(f"Planning at PROGADDR {progaddr:05X}...")
+        plan = _as_loader_error(build_load_plan, session, progaddr)
         write_link_map(plan, map_path)
         print(f"Link map written: {map_path}")
         print_load_map(plan)
