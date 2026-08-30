@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from loader_semantics import analyze_object_records
+from macro import load_macro_provenance
 from source_map import (
     SourceMapError,
     _fingerprint,
@@ -23,7 +24,51 @@ def _object_sections(obj_path):
         raise SourceMapError(f"Cannot align source map with invalid object program: {exc}") from exc
 
 
-def build_object_aligned_source_map(expanded_path, int_path, obj_path, csects, parse_line):
+def _attach_macro_provenance(payload, macro_provenance_path):
+    if macro_provenance_path is None:
+        return
+    try:
+        provenance = load_macro_provenance(
+            macro_provenance_path,
+            expanded_sha256=payload["expanded_source_sha256"],
+        )
+    except ValueError as exc:
+        raise SourceMapError(str(exc)) from exc
+
+    by_line = {
+        item["expanded_line"]: item
+        for item in provenance["lines"]
+    }
+    payload["original_source_sha256"] = provenance["original_source_sha256"]
+    payload["macro_provenance_fingerprint"] = provenance["macro_provenance_fingerprint"]
+
+    for section in payload["sections"]:
+        for region in section["regions"]:
+            expanded_line = region.get("expanded_line")
+            if expanded_line is None:
+                region["provenance"] = None
+                continue
+            origin = by_line.get(expanded_line)
+            if origin is None:
+                raise SourceMapError(
+                    f"Macro provenance has no expanded line {expanded_line}"
+                )
+            region["provenance"] = {
+                "kind": origin["kind"],
+                "source_line": origin["source_line"],
+                "invocation_line": origin["invocation_line"],
+                "macro_stack": origin["macro_stack"],
+            }
+
+
+def build_object_aligned_source_map(
+    expanded_path,
+    int_path,
+    obj_path,
+    csects,
+    parse_line,
+    macro_provenance_path=None,
+):
     """Build source metadata whose public CSECT identity matches H records.
 
     Pass-1 internal names can differ from serialized compatibility names (for
@@ -32,6 +77,7 @@ def build_object_aligned_source_map(expanded_path, int_path, obj_path, csects, p
     assembler alias.
     """
     payload = build_source_map(expanded_path, int_path, obj_path, csects, parse_line)
+    _attach_macro_provenance(payload, macro_provenance_path)
     object_sections = _object_sections(obj_path)
     mapped_sections = payload["sections"]
     if len(mapped_sections) != len(object_sections):
@@ -64,6 +110,7 @@ def write_object_aligned_source_map(
     csects,
     parse_line,
     output_path=None,
+    macro_provenance_path=None,
 ):
     path = output_path or default_source_map_path(obj_path)
     source_map = build_object_aligned_source_map(
@@ -72,5 +119,6 @@ def write_object_aligned_source_map(
         obj_path,
         csects,
         parse_line,
+        macro_provenance_path=macro_provenance_path,
     )
     return _write_atomic_text(path, render_source_map(source_map))
