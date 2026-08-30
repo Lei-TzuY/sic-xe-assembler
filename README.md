@@ -1,6 +1,6 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, forward `EQU`, `ORG`, object-program contract validation, and a linking loader.
+A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, forward `EQU`, `ORG`, object-program contract validation, assembler semantic checks, and a linking loader.
 
 ## Run the assembler
 
@@ -11,6 +11,8 @@ python assembler.py test_xe.asm
 For `program.asm`, the assembler writes `program.expanded.asm`, `program.int`, `program.sym`, `program.obj`, and `program.lst` beside the source file.
 
 Object-program names used by control sections, `EXTDEF`, and `EXTREF` must fit the SIC/XE six-character fixed field: 1–6 ASCII alphanumeric characters beginning with a letter. Duplicate or colliding external namespaces are rejected instead of being silently truncated. Large D/R records are split to the standard 73-character record bound, and generated H/D/R/T/M/E framing is validated before assembly succeeds.
+
+After Pass 1 has assigned final program-block addresses, the assembler checks initialized storage for overlap. Instructions, `WORD`, `BYTE`, and emitted literal bytes may not overwrite earlier initialized bytes, even after `ORG` moves LOCCTR backward. `RESB`/`RESW` remain reservations rather than initialized storage, so the conventional pattern of using `ORG` to define fields inside a reserved buffer remains valid. After Pass 2, the generated object file is also run through the same semantic analyzer used by the loader; an object file that the loader would reject can therefore never be reported as a successful assembly.
 
 ## Macro processor
 
@@ -81,7 +83,7 @@ FIELD    RESW    1
          ORG
 ```
 
-`ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. With program blocks, `ORG` must resolve within the currently active block. Block length uses the highest location reached, so moving LOCCTR backward cannot truncate the final block or H-record length.
+`ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. With program blocks, `ORG` must resolve within the currently active block. Block length uses the highest location reached, so moving LOCCTR backward cannot truncate the final block or H-record length. If a backward `ORG` causes new object-producing statements or a literal pool to overwrite already initialized bytes, assembly fails at the offending source line and reports the conflicting address range.
 
 ## External relocation expressions
 
@@ -116,4 +118,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, external symbols, local/external relocation records, semantic loader validation, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
