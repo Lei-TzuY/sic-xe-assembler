@@ -56,9 +56,41 @@ Verification does not trust a previous `.map` or an earlier in-memory load plan.
 
 This detects binary tampering, substituted/reordered object inputs, changed PROGADDR/link identity, modified manifest metadata, and noncanonical manifest serialization.
 
+## Inspect
+
+```text
+python sicxe.py inspect program.obj
+python sicxe.py inspect program.obj --disassemble
+python sicxe.py inspect program.obj --json
+python sicxe.py inspect program.manifest.json
+```
+
+Object inspection runs the same structural/semantic object analyzer as the loader before displaying CSECT, D/R/T/M/E, raw SHA-256, text bytes, relocation sites, and entry data. `--disassemble` linear-sweeps T-record payloads and attaches overlapping M records to decoded instructions/data fields.
+
+Manifest inspection shows PROGADDR, image range/SHA, INPUTSET, LINKID, input identities, section placement, and entry provenance. If the adjacent `.bin` exists it is auto-detected and its current length/SHA are compared against the manifest. Use `--image` to select a different binary explicitly.
+
+`--json` exposes object/manifest inspection as machine-readable structured output.
+
+Inspection explains persisted state; it intentionally does not replace `verify`, which independently re-links the supplied object inputs.
+
+## Disassemble
+
+```text
+python sicxe.py disasm program.bin --start 4000
+python sicxe.py disasm program.bin --manifest program.manifest.json
+python sicxe.py disasm program.bin --manifest program.manifest.json --base 8000
+python sicxe.py disasm program.bin --manifest program.manifest.json --offset 32 --length 64
+```
+
+The disassembler decodes SIC/XE formats 1–4, format-2 operand signatures, `nixbpe`, addressing prefixes, PC-relative targets, optional base-relative targets, indexed addressing, and format-4 20-bit targets. Unknown/truncated bytes fall back to one-byte `.BYTE` records so linear sweep remains deterministic.
+
+When a manifest is supplied, its `image_start` becomes the disassembly origin. Supplying a conflicting `--start` is a hard error.
+
+Flat SIC/XE images do not carry a general code/data map, so disassembly is deliberately described as linear sweep rather than source reconstruction. Valid data bytes can resemble valid instructions. See [`inspection-disassembly.md`](inspection-disassembly.md) for the exact contract and limitations.
+
 ## Expression language
 
-Assembler expressions now use a real precedence parser rather than additive string splitting.
+Assembler expressions use a real precedence parser rather than additive string splitting.
 
 Supported operators, from highest to lowest precedence:
 
