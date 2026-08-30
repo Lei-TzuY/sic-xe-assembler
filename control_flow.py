@@ -1,4 +1,9 @@
 from disassembler import decode_instruction
+from static_analysis import (
+    analyze_register_constants,
+    known_registers,
+    resolve_dynamic_base_targets,
+)
 
 
 CONDITIONAL_BRANCHES = {"JEQ", "JGT", "JLT"}
@@ -39,7 +44,7 @@ def _format_provenance(provenance):
     )
 
 
-def _typed_instruction_nodes(image, image_start, debug_map, base_register=None):
+def _typed_instruction_nodes(image, image_start, debug_map):
     raw = bytes(image)
     nodes = []
     for section in debug_map.get("sections", ()):
@@ -55,21 +60,20 @@ def _typed_instruction_nodes(image, image_start, debug_map, base_register=None):
                 raise ControlFlowError(
                     f"Instruction region {address:05X}+{length} lies outside linked image"
                 )
-            decoded = decode_instruction(
-                raw[offset:offset + length],
-                address=address,
-                base_register=base_register,
-            )
+            payload = raw[offset:offset + length]
+            decoded = decode_instruction(payload, address=address, base_register=None)
             nodes.append({
                 "address": address,
                 "end": address + length,
                 "size": length,
                 "decoded_size": decoded.size,
+                "bytes": payload.hex().upper(),
                 "mnemonic": decoded.mnemonic,
                 "base_mnemonic": _normalize_mnemonic(decoded.mnemonic),
                 "operand": decoded.operand,
                 "target": decoded.target,
                 "flags": decoded.flags,
+                "warning": decoded.warning,
                 "symbols": list(region.get("symbols") or ()),
                 "expanded_line": region.get("expanded_line"),
                 "provenance": region.get("provenance"),
@@ -115,6 +119,7 @@ def _instruction_edges(nodes):
             "kind": kind,
             "resolved": resolved,
             "reason": reason if reason is not None else (None if resolved else "outside-typed-code"),
+            "resolution": source.get("target_resolution"),
         })
 
     for node in nodes:
@@ -156,6 +161,34 @@ def _instruction_edges(nodes):
         )
     )
     return edges
+
+
+def _resolve_dataflow_targets(nodes, entry_address, initial_base):
+    initial_registers = {} if initial_base is None else {"B": initial_base}
+    edges = _instruction_edges(nodes)
+    facts = {}
+    max_iterations = max(2, len(nodes) + 2)
+    for _ in range(max_iterations):
+        facts = analyze_register_constants(
+            nodes,
+            edges,
+            entry_address,
+            initial_registers=initial_registers,
+        )
+        if not resolve_dynamic_base_targets(nodes, facts):
+            break
+        edges = _instruction_edges(nodes)
+    else:
+        raise ControlFlowError("Base-relative dataflow resolution did not converge")
+
+    edges = _instruction_edges(nodes)
+    facts = analyze_register_constants(
+        nodes,
+        edges,
+        entry_address,
+        initial_registers=initial_registers,
+    )
+    return edges, facts
 
 
 def _reachable_addresses(entry_address, nodes, edges):
@@ -241,46 +274,267 @@ def _build_blocks(entry_address, nodes, edges, reachable):
             "end": block_nodes[-1]["end"],
             "instruction_addresses": [node["address"] for node in block_nodes],
             "reachable": any(node["address"] in reachable for node in block_nodes),
+            "predecessors": [],
+            "successors": [],
         })
 
     for edge in edges:
         edge["source_block"] = address_to_block.get(edge["source"])
         edge["target_block"] = address_to_block.get(edge["target"])
+
+    by_block = {block["id"]: block for block in blocks}
+    for edge in edges:
+        source_block = edge.get("source_block")
+        target_block = edge.get("target_block")
+        if not edge.get("resolved") or source_block is None or target_block is None:
+            continue
+        if target_block not in by_block[source_block]["successors"]:
+            by_block[source_block]["successors"].append(target_block)
+        if source_block not in by_block[target_block]["predecessors"]:
+            by_block[target_block]["predecessors"].append(source_block)
+    for block in blocks:
+        block["predecessors"].sort()
+        block["successors"].sort()
     return blocks, address_to_block
 
 
-def analyze_control_flow(image, image_start, debug_map, entry_address, base_register=None):
-    """Build a deterministic CFG from typed instruction regions only."""
-    nodes = _typed_instruction_nodes(
-        image,
-        image_start,
-        debug_map,
-        base_register=base_register,
+def _compute_dominators(entry_address, blocks, address_to_block, edges):
+    entry_block = address_to_block.get(entry_address)
+    reachable_blocks = {block["id"] for block in blocks if block["reachable"]}
+    if entry_block is None or entry_block not in reachable_blocks:
+        return {}, None
+
+    predecessors = {block_id: set() for block_id in reachable_blocks}
+    for edge in edges:
+        source = edge.get("source_block")
+        target = edge.get("target_block")
+        if edge.get("resolved") and source in reachable_blocks and target in reachable_blocks:
+            predecessors[target].add(source)
+
+    dominators = {}
+    for block_id in reachable_blocks:
+        dominators[block_id] = {block_id} if block_id == entry_block else set(reachable_blocks)
+
+    changed = True
+    while changed:
+        changed = False
+        for block_id in sorted(reachable_blocks):
+            if block_id == entry_block:
+                continue
+            preds = predecessors[block_id]
+            if not preds:
+                new_value = {block_id}
+            else:
+                intersection = set(reachable_blocks)
+                for predecessor in preds:
+                    intersection &= dominators[predecessor]
+                new_value = {block_id} | intersection
+            if new_value != dominators[block_id]:
+                dominators[block_id] = new_value
+                changed = True
+
+    return {
+        block_id: sorted(values)
+        for block_id, values in sorted(dominators.items())
+    }, entry_block
+
+
+def _natural_loops(blocks, edges, dominators):
+    predecessors = {block["id"]: set() for block in blocks}
+    for edge in edges:
+        source = edge.get("source_block")
+        target = edge.get("target_block")
+        if edge.get("resolved") and edge.get("kind") != "call" and source is not None and target is not None:
+            predecessors[target].add(source)
+
+    back_edges = []
+    loops = []
+    for edge in edges:
+        source = edge.get("source_block")
+        target = edge.get("target_block")
+        if (
+            not edge.get("resolved")
+            or edge.get("kind") == "call"
+            or source is None
+            or target is None
+            or source not in dominators
+            or target not in dominators[source]
+        ):
+            continue
+        back_edges.append({
+            "source_block": source,
+            "target_block": target,
+            "source": edge["source"],
+            "target": edge["target"],
+            "kind": edge["kind"],
+        })
+        members = {target, source}
+        pending = [source]
+        while pending:
+            current = pending.pop()
+            for predecessor in predecessors.get(current, ()):
+                if predecessor not in members:
+                    members.add(predecessor)
+                    pending.append(predecessor)
+        loops.append({
+            "header": target,
+            "latch": source,
+            "blocks": sorted(members),
+        })
+
+    loops.sort(key=lambda item: (item["header"], item["latch"], item["blocks"]))
+    back_edges.sort(key=lambda item: (item["target_block"], item["source_block"], item["kind"]))
+    return back_edges, loops
+
+
+def _weak_component_count(nodes, edges):
+    nodes = set(nodes)
+    if not nodes:
+        return 0
+    adjacency = {node: set() for node in nodes}
+    for source, target in edges:
+        if source in nodes and target in nodes:
+            adjacency[source].add(target)
+            adjacency[target].add(source)
+    count = 0
+    remaining = set(nodes)
+    while remaining:
+        count += 1
+        pending = [remaining.pop()]
+        while pending:
+            current = pending.pop()
+            for neighbor in adjacency[current]:
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    pending.append(neighbor)
+    return count
+
+
+def _graph_metrics(blocks, edges, nodes, loops):
+    reachable_blocks = {block["id"] for block in blocks if block["reachable"]}
+    intraprocedural_edges = []
+    for edge in edges:
+        source = edge.get("source_block")
+        target = edge.get("target_block")
+        if (
+            edge.get("resolved")
+            and edge.get("kind") != "call"
+            and source in reachable_blocks
+            and target in reachable_blocks
+        ):
+            intraprocedural_edges.append((source, target, edge["kind"]))
+    unique_edges = sorted(set(intraprocedural_edges))
+    weak_edges = {(source, target) for source, target, _ in unique_edges}
+    components = _weak_component_count(reachable_blocks, weak_edges)
+    node_count = len(reachable_blocks)
+    edge_count = len(unique_edges)
+    complexity = edge_count - node_count + (2 * components) if node_count else 0
+    decision_points = sum(
+        1
+        for node in nodes
+        if node["reachable"] and node["base_mnemonic"] in CONDITIONAL_BRANCHES
     )
-    edges = _instruction_edges(nodes)
+    return {
+        "reachable_blocks": node_count,
+        "resolved_intraprocedural_edges": edge_count,
+        "weak_components": components,
+        "cyclomatic_complexity": complexity,
+        "decision_points": decision_points,
+        "natural_loops": len(loops),
+    }
+
+
+def _call_graph(nodes, edges):
+    by_address = {node["address"]: node for node in nodes}
+    symbols_by_address = {
+        node["address"]: tuple(node.get("symbols") or ())
+        for node in nodes
+        if node.get("symbols")
+    }
+    calls = []
+    for edge in edges:
+        if edge["kind"] != "call":
+            continue
+        source_node = by_address[edge["source"]]
+        target_node = by_address.get(edge.get("target"))
+        calls.append({
+            "source": edge["source"],
+            "source_block": edge.get("source_block"),
+            "caller_section": source_node["section"],
+            "target": edge.get("target"),
+            "target_block": edge.get("target_block"),
+            "callee_section": None if target_node is None else target_node["section"],
+            "target_symbols": list(symbols_by_address.get(edge.get("target"), ())),
+            "resolved": edge["resolved"],
+            "reason": edge.get("reason"),
+            "resolution": edge.get("resolution"),
+        })
+    return calls
+
+
+def analyze_control_flow(image, image_start, debug_map, entry_address, base_register=None):
+    """Build a conservative typed CFG with must-constant register dataflow."""
+    nodes = _typed_instruction_nodes(image, image_start, debug_map)
+    edges, register_facts = _resolve_dataflow_targets(nodes, entry_address, base_register)
     reachable = _reachable_addresses(entry_address, nodes, edges)
-    blocks, address_to_block = _build_blocks(entry_address, nodes, edges, reachable)
 
     for node in nodes:
         node["reachable"] = node["address"] in reachable
+        facts = register_facts.get(node["address"], {"in": None, "out": None})
+        node["registers_in"] = facts["in"]
+        node["registers_out"] = facts["out"]
+
+    blocks, address_to_block = _build_blocks(entry_address, nodes, edges, reachable)
+    for node in nodes:
         node["block"] = address_to_block.get(node["address"])
+
+    dominators, entry_block = _compute_dominators(entry_address, blocks, address_to_block, edges)
+    for block in blocks:
+        block["dominators"] = dominators.get(block["id"], [])
+
+    back_edges, loops = _natural_loops(blocks, edges, dominators)
+    calls = _call_graph(nodes, edges)
+    metrics = _graph_metrics(blocks, edges, nodes, loops)
 
     return {
         "entry_address": entry_address,
+        "entry_block": entry_block,
         "entry_resolved": any(node["address"] == entry_address for node in nodes),
         "instructions": nodes,
         "blocks": blocks,
         "edges": edges,
+        "dominators": dominators,
+        "back_edges": back_edges,
+        "loops": loops,
+        "calls": calls,
+        "metrics": metrics,
         "reachable_instruction_count": len(reachable),
         "unreachable_instruction_count": len(nodes) - len(reachable),
     }
 
 
+def _format_known_state(state):
+    facts = known_registers(state)
+    if not facts:
+        return "-"
+    return ",".join(f"{register}={value:06X}" for register, value in sorted(facts.items()))
+
+
 def render_control_flow_report(report):
+    metrics = report.get("metrics", {})
     lines = [
         "SIC/XE CONTROL FLOW GRAPH",
         f"ENTRY       {report['entry_address']:05X} ({'typed' if report['entry_resolved'] else 'not in typed code'})",
         f"INSTRUCTIONS {len(report['instructions'])} reachable={report['reachable_instruction_count']} unreachable={report['unreachable_instruction_count']}",
+        (
+            "METRICS     "
+            f"blocks={metrics.get('reachable_blocks', 0)} "
+            f"edges={metrics.get('resolved_intraprocedural_edges', 0)} "
+            f"components={metrics.get('weak_components', 0)} "
+            f"complexity={metrics.get('cyclomatic_complexity', 0)} "
+            f"decisions={metrics.get('decision_points', 0)} "
+            f"loops={metrics.get('natural_loops', 0)}"
+        ),
         "",
         "BASIC BLOCKS",
     ]
@@ -289,34 +543,82 @@ def render_control_flow_report(report):
         lines.append(
             f"  {block['id']} {block['start']:05X}-{block['end']:05X} "
             f"[{block['input_index']}:{block['section_index']}] {block['section']} "
-            f"{'reachable' if block['reachable'] else 'UNREACHABLE'}"
+            f"{'reachable' if block['reachable'] else 'UNREACHABLE'} "
+            f"pred={','.join(block['predecessors']) or '-'} "
+            f"succ={','.join(block['successors']) or '-'} "
+            f"dom={','.join(block.get('dominators') or ()) or '-'}"
         )
         for address in block["instruction_addresses"]:
             node = by_address[address]
             assembly = node["mnemonic"] + ((" " + node["operand"]) if node["operand"] else "")
-            lines.append(
-                f"    {address:05X}  {assembly} ; {_format_provenance(node.get('provenance'))}"
+            resolution = (
+                f"; target-resolution={node['target_resolution']} B={node['base_value']:06X}"
+                if node.get("target_resolution")
+                else ""
             )
+            lines.append(
+                f"    {address:05X}  {assembly} ; {_format_provenance(node.get('provenance'))}{resolution}"
+            )
+
+    lines.extend(["", "REGISTER FACTS"])
+    any_register_facts = False
+    for node in report["instructions"]:
+        incoming = _format_known_state(node.get("registers_in"))
+        outgoing = _format_known_state(node.get("registers_out"))
+        if incoming == outgoing == "-":
+            continue
+        any_register_facts = True
+        lines.append(f"  {node['address']:05X} in={incoming} out={outgoing}")
+    if not any_register_facts:
+        lines.append("  -")
 
     lines.extend(["", "EDGES"])
     for edge in report["edges"]:
         target = "?" if edge["target"] is None else f"{edge['target']:05X}"
         target_block = edge.get("target_block") or "-"
         status = "resolved" if edge["resolved"] else (edge.get("reason") or "unresolved")
+        if edge.get("resolution"):
+            status += "/" + edge["resolution"]
         lines.append(
             f"  {edge.get('source_block') or '-'}:{edge['source']:05X} "
             f"--{edge['kind']}--> {target_block}:{target} [{status}]"
         )
+
+    lines.extend(["", "NATURAL LOOPS"])
+    if report.get("loops"):
+        for index, loop in enumerate(report["loops"]):
+            lines.append(
+                f"  L{index:03d} header={loop['header']} latch={loop['latch']} "
+                f"blocks={','.join(loop['blocks'])}"
+            )
+    else:
+        lines.append("  -")
+
+    lines.extend(["", "CALL GRAPH"])
+    if report.get("calls"):
+        for call in report["calls"]:
+            target = "?" if call["target"] is None else f"{call['target']:05X}"
+            symbols = ",".join(call["target_symbols"]) or "-"
+            status = "resolved" if call["resolved"] else (call.get("reason") or "unresolved")
+            lines.append(
+                f"  {call['source_block'] or '-'}:{call['source']:05X} "
+                f"{call['caller_section']} -> {call['target_block'] or '-'}:{target} "
+                f"{call['callee_section'] or '?'} symbols={symbols} [{status}]"
+            )
+    else:
+        lines.append("  -")
     return "\n".join(lines) + "\n"
 
 
 def render_control_flow_dot(report):
     lines = ["digraph sicxe_cfg {", "  rankdir=TB;"]
+    loop_blocks = {block for loop in report.get("loops", ()) for block in loop["blocks"]}
     for block in report["blocks"]:
         state = "reachable" if block["reachable"] else "unreachable"
+        loop = "\\nloop" if block["id"] in loop_blocks else ""
         label = (
             f"{block['id']}\\n{block['section']} "
-            f"{block['start']:05X}-{block['end']:05X}\\n{state}"
+            f"{block['start']:05X}-{block['end']:05X}\\n{state}{loop}"
         )
         lines.append(f'  {block["id"]} [label="{label}"];')
     seen = set()
@@ -329,13 +631,16 @@ def render_control_flow_dot(report):
         if key in seen:
             continue
         seen.add(key)
-        lines.append(f'  {source} -> {target} [label="{edge["kind"]}"];')
+        label = edge["kind"]
+        if edge.get("resolution"):
+            label += "/" + edge["resolution"]
+        lines.append(f'  {source} -> {target} [label="{label}"];')
     lines.append("}")
     return "\n".join(lines) + "\n"
 
 
 def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
-    """Attach original-source/macro provenance and optional CFG state to typed output."""
+    """Attach original-source/macro provenance, dataflow, and optional CFG state."""
     provenance_by_address = {}
     for section in debug_map.get("sections", ()):
         for region in section.get("regions", ()):
@@ -363,6 +668,18 @@ def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
             annotations.append(
                 f"cfg={'reachable' if node['reachable'] else 'UNREACHABLE'}; block={node['block']}"
             )
+            known_in = known_registers(node.get("registers_in"))
+            if known_in:
+                annotations.append(
+                    "regs_in=" + ",".join(
+                        f"{register}={value:06X}"
+                        for register, value in sorted(known_in.items())
+                    )
+                )
+            if node.get("target_resolution"):
+                annotations.append(
+                    f"target_resolution={node['target_resolution']}; B={node['base_value']:06X}"
+                )
         if annotations:
             line += " ; " + "; ".join(annotations)
         lines.append(line)
