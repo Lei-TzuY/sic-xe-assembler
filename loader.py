@@ -121,9 +121,6 @@ def pass2(obj_files, progaddr, estab):
             raise LoaderError(mismatch)
         session = estab.link_session
     else:
-        # Compatibility path for callers that intentionally pass a plain dict.
-        # Such callers have discarded the Pass-1 snapshot, so capture the
-        # current files once and still perform the complete load-plan preflight.
         session = _as_loader_error(capture_link_session, obj_files)
 
     plan = _as_loader_error(build_load_plan, session, progaddr)
@@ -202,27 +199,42 @@ def _remove_stale_artifacts(paths):
             pass
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python loader.py <obj_file1> [obj_file2 ...] [PROGADDR]")
-        return 1
-
-    args = sys.argv[1:]
+def _parse_cli_arguments(args):
     progaddr = 0x4000
+    progaddr_seen = False
     obj_files = []
 
     for arg in args:
         if os.path.exists(arg):
             obj_files.append(arg)
-        else:
-            try:
-                progaddr = int(arg, 16)
-            except ValueError:
-                pass
+            continue
+        try:
+            candidate = int(arg, 16)
+        except ValueError as exc:
+            raise LoaderError(
+                f"Unknown argument or unreadable object file: {arg}"
+            ) from exc
+        if progaddr_seen:
+            raise LoaderError("PROGADDR may be specified at most once")
+        progaddr = candidate
+        progaddr_seen = True
 
     if not obj_files:
-        print("Error: No valid object files provided.", file=sys.stderr)
-        return 1
+        raise LoaderError("No valid object files provided")
+    return obj_files, progaddr
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    if not args:
+        print("Usage: python loader.py <obj_file1> [obj_file2 ...] [PROGADDR]", file=sys.stderr)
+        return 2
+
+    try:
+        obj_files, progaddr = _parse_cli_arguments(args)
+    except LoaderError as exc:
+        print(f"Load failed: {exc}", file=sys.stderr)
+        return 2
 
     map_path = default_map_path(obj_files)
     image_path = default_image_path(obj_files)
@@ -236,8 +248,6 @@ def main():
         print(f"Planning at PROGADDR {progaddr:05X}...")
         plan = _as_loader_error(build_load_plan, session, progaddr)
 
-        # Materialize first. Persistent artifacts are emitted only after the
-        # complete validated plan has produced the exact final image bytes.
         memory, exec_addr = apply_load_plan(plan)
         written_image, written_manifest = write_linked_image_artifacts(
             plan,
