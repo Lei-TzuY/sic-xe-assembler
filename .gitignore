@@ -4,3 +4,5 @@ __pycache__/
 *.map
 *.bin
 *.manifest.json
+*.sourcemap.json
+*.debug.json
