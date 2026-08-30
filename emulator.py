@@ -22,56 +22,16 @@ _OPCODE_BY_BYTE = {
 _REGISTER_BY_NUMBER = {value: name for name, value in REGISTERS.items()}
 
 SUPPORTED_FORMAT1 = frozenset()
-SUPPORTED_FORMAT2 = frozenset(
-    {
-        "ADDR",
-        "CLEAR",
-        "COMPR",
-        "DIVR",
-        "MULR",
-        "RMO",
-        "SHIFTL",
-        "SHIFTR",
-        "SUBR",
-        "SVC",
-        "TIXR",
-    }
-)
-SUPPORTED_FORMAT34 = frozenset(
-    {
-        "ADD",
-        "AND",
-        "COMP",
-        "DIV",
-        "J",
-        "JEQ",
-        "JGT",
-        "JLT",
-        "JSUB",
-        "LDA",
-        "LDB",
-        "LDCH",
-        "LDL",
-        "LDS",
-        "LDT",
-        "LDX",
-        "MUL",
-        "OR",
-        "RD",
-        "RSUB",
-        "STA",
-        "STB",
-        "STCH",
-        "STL",
-        "STS",
-        "STT",
-        "STX",
-        "SUB",
-        "TD",
-        "TIX",
-        "WD",
-    }
-)
+SUPPORTED_FORMAT2 = frozenset({
+    "ADDR", "CLEAR", "COMPR", "DIVR", "MULR", "RMO", "SHIFTL",
+    "SHIFTR", "SUBR", "SVC", "TIXR",
+})
+SUPPORTED_FORMAT34 = frozenset({
+    "ADD", "AND", "COMP", "DIV", "J", "JEQ", "JGT", "JLT", "JSUB",
+    "LDA", "LDB", "LDCH", "LDL", "LDS", "LDT", "LDX", "MUL", "OR",
+    "RD", "RSUB", "STA", "STB", "STCH", "STL", "STS", "STT", "STX",
+    "SUB", "TD", "TIX", "WD",
+})
 
 
 class ExecutionTrap(ValueError):
@@ -121,11 +81,7 @@ class ExecutionResult:
 
 
 class BufferedDevice:
-    """Deterministic byte-oriented device used by RD/WD/TD.
-
-    A device can be configured readable, writable, and ready independently.
-    TD observes `ready`; RD additionally requires one queued byte.
-    """
+    """Deterministic byte-oriented device used by RD/WD/TD."""
 
     def __init__(self, input_bytes=b"", readable=True, writable=True, ready=True):
         self.input = deque(bytes(input_bytes))
@@ -178,6 +134,31 @@ class DeviceBus:
             raise ExecutionTrap(f"unconfigured output device {device_id:02X}")
         device.write(value)
 
+    def snapshot(self):
+        return {
+            device_id: (
+                tuple(device.input), bytes(device.output), device.readable,
+                device.writable, device.ready,
+            )
+            for device_id, device in self.devices.items()
+        }
+
+    def restore(self, snapshot):
+        for device_id in list(self.devices):
+            if device_id not in snapshot:
+                del self.devices[device_id]
+        for device_id, state in snapshot.items():
+            device = self.devices.get(device_id)
+            if device is None:
+                device = BufferedDevice()
+                self.devices[device_id] = device
+            input_bytes, output_bytes, readable, writable, ready = state
+            device.input = deque(input_bytes)
+            device.output = bytearray(output_bytes)
+            device.readable = readable
+            device.writable = writable
+            device.ready = ready
+
     def outputs(self):
         return {
             f"{device_id:02X}": bytes(device.output).hex().upper()
@@ -225,27 +206,14 @@ def _jsonable(value):
 class SicXeMachine:
     """Deterministic SIC/XE execution engine for the integer/core ISA profile."""
 
-    def __init__(
-        self,
-        memory=None,
-        entry_address=0,
-        debug_map=None,
-        devices=None,
-        stop_on_zero_return=True,
-    ):
+    def __init__(self, memory=None, entry_address=0, debug_map=None, devices=None,
+                 stop_on_zero_return=True):
         self.memory = bytearray(SICXE_MEMORY_SIZE) if memory is None else bytearray(memory)
         if len(self.memory) != SICXE_MEMORY_SIZE:
             raise ValueError(f"Machine memory must be exactly {SICXE_MEMORY_SIZE} bytes")
         self.registers = {
-            "A": 0,
-            "X": 0,
-            "L": 0,
-            "B": 0,
-            "S": 0,
-            "T": 0,
-            "F": 0,
-            "PC": 0,
-            "SW": 0,
+            "A": 0, "X": 0, "L": 0, "B": 0, "S": 0, "T": 0,
+            "F": 0, "PC": 0, "SW": 0,
         }
         self.cc = CC_EQ
         self.devices = devices if devices is not None else DeviceBus()
@@ -255,15 +223,8 @@ class SicXeMachine:
         self.set_register("PC", entry_address)
 
     @classmethod
-    def from_image(
-        cls,
-        image,
-        image_start,
-        entry_address,
-        debug_map=None,
-        devices=None,
-        stop_on_zero_return=True,
-    ):
+    def from_image(cls, image, image_start, entry_address, debug_map=None,
+                   devices=None, stop_on_zero_return=True):
         raw = bytes(image)
         if image_start < 0 or image_start > SICXE_MAX_ADDRESS:
             raise ValueError(f"Image start outside SIC/XE memory: {image_start:#x}")
@@ -273,20 +234,15 @@ class SicXeMachine:
             )
         memory = bytearray(SICXE_MEMORY_SIZE)
         memory[image_start:image_start + len(raw)] = raw
-        return cls(
-            memory=memory,
-            entry_address=entry_address,
-            debug_map=debug_map,
-            devices=devices,
-            stop_on_zero_return=stop_on_zero_return,
-        )
+        return cls(memory=memory, entry_address=entry_address, debug_map=debug_map,
+                   devices=devices, stop_on_zero_return=stop_on_zero_return)
 
     @staticmethod
     def _build_instruction_context(debug_map):
         context = {}
         if not debug_map:
             return context
-        for section in debug_map.get("sections", ()):  # metadata is optional
+        for section in debug_map.get("sections", ()):
             if not section.get("typed"):
                 continue
             for region in section.get("regions", ()):
@@ -342,11 +298,8 @@ class SicXeMachine:
 
     def read_word(self, address):
         self._check_range(address, 3)
-        return (
-            (self.memory[address] << 16)
-            | (self.memory[address + 1] << 8)
-            | self.memory[address + 2]
-        )
+        return ((self.memory[address] << 16) | (self.memory[address + 1] << 8)
+                | self.memory[address + 2])
 
     def _write_byte(self, address, value, writes):
         self._check_range(address, 1, "memory write")
@@ -358,9 +311,8 @@ class SicXeMachine:
     def _write_word(self, address, value, writes):
         self._check_range(address, 3, "memory write")
         encoded = u24(value)
-        for offset, byte in enumerate(
-            ((encoded >> 16) & 0xFF, (encoded >> 8) & 0xFF, encoded & 0xFF)
-        ):
+        for offset, byte in enumerate(((encoded >> 16) & 0xFF,
+                                       (encoded >> 8) & 0xFF, encoded & 0xFF)):
             self._write_byte(address + offset, byte, writes)
 
     def _register_name(self, number, pc):
@@ -372,7 +324,9 @@ class SicXeMachine:
     def _integer_register(self, number, pc):
         name = self._register_name(number, pc)
         if name == "F":
-            raise ExecutionTrap("48-bit F register is not valid in integer execution profile", pc=pc)
+            raise ExecutionTrap(
+                "48-bit F register is not valid in integer execution profile", pc=pc
+            )
         return name
 
     def _fetch(self, pc):
@@ -390,11 +344,7 @@ class SicXeMachine:
             self._check_range(pc, 3, "instruction fetch")
             n = (first >> 1) & 1
             i = first & 1
-            if (n, i) == (0, 0):
-                size = 3
-            else:
-                e = (self.memory[pc + 1] >> 4) & 1
-                size = 4 if e else 3
+            size = 3 if (n, i) == (0, 0) else (4 if (self.memory[pc + 1] >> 4) & 1 else 3)
         self._check_range(pc, size, "instruction fetch")
         raw = bytes(self.memory[pc:pc + size])
         decoded = decode_instruction(raw, address=pc, base_register=self.registers["B"])
@@ -408,7 +358,6 @@ class SicXeMachine:
         i = first & 1
         second = raw[1]
         x = (second >> 7) & 1
-
         if (n, i) == (0, 0):
             target = ((second & 0x7F) << 8) | raw[2]
             if x:
@@ -425,7 +374,6 @@ class SicXeMachine:
             raise ExecutionTrap("illegal format-4 addressing flags: b/p must be zero", pc=pc)
         if x and (n, i) != (1, 1):
             raise ExecutionTrap("indexed addressing requires simple n=i=1 mode", pc=pc)
-
         if e:
             field = ((second & 0x0F) << 16) | (raw[2] << 8) | raw[3]
             target = field
@@ -438,13 +386,10 @@ class SicXeMachine:
                 target = self.registers["B"] + field
             else:
                 target = field
-
         if x:
             target += self.registers["X"]
-
         if (n, i) == (0, 1):
             return AddressOperand("immediate", target, None, u24(target))
-
         self._check_address(target, pc, "target address")
         if (n, i) == (1, 0):
             pointer = self.read_word(target)
@@ -454,16 +399,10 @@ class SicXeMachine:
             return AddressOperand("simple", target, target, None)
         raise ExecutionTrap(f"unsupported n/i addressing combination {n}{i}", pc=pc)
 
-    @staticmethod
-    def _check_address_static(address, description):
-        if not 0 <= address <= SICXE_MAX_ADDRESS:
-            raise ExecutionTrap(f"{description} outside 20-bit SIC/XE memory: {address:#x}")
-
     def _check_address(self, address, pc, description):
         if not 0 <= address <= SICXE_MAX_ADDRESS:
             raise ExecutionTrap(
-                f"{description} outside 20-bit SIC/XE memory: {address:#x}",
-                pc=pc,
+                f"{description} outside 20-bit SIC/XE memory: {address:#x}", pc=pc
             )
 
     def _operand_word(self, operand, pc):
@@ -483,10 +422,7 @@ class SicXeMachine:
         return operand.effective_address
 
     def _jump_address(self, operand, pc):
-        if operand.mode == "immediate":
-            target = operand.immediate_value
-        else:
-            target = operand.effective_address
+        target = operand.immediate_value if operand.mode == "immediate" else operand.effective_address
         self._check_address(target, pc, "branch target")
         return target
 
@@ -497,60 +433,39 @@ class SicXeMachine:
         operand_byte = raw[1]
         r1 = (operand_byte >> 4) & 0xF
         r2 = operand_byte & 0xF
-        stop_reason = None
-        service_code = None
-
         if mnemonic == "SVC":
-            service_code = r1
-            return next_pc, "svc", service_code
-
+            return next_pc, "svc", r1
         if mnemonic in {"CLEAR", "TIXR"}:
             name1 = self._integer_register(r1, pc)
         else:
             name1 = self._integer_register(r1, pc)
             name2 = self._integer_register(r2, pc)
-
         if mnemonic == "CLEAR":
             self.set_register(name1, 0)
         elif mnemonic == "RMO":
             self.set_register(name2, self.get_register(name1))
         elif mnemonic == "ADDR":
-            self.set_register(
-                name2,
-                s24(self.get_register(name2)) + s24(self.get_register(name1)),
-            )
+            self.set_register(name2, s24(self.get_register(name2)) + s24(self.get_register(name1)))
         elif mnemonic == "SUBR":
-            self.set_register(
-                name2,
-                s24(self.get_register(name2)) - s24(self.get_register(name1)),
-            )
+            self.set_register(name2, s24(self.get_register(name2)) - s24(self.get_register(name1)))
         elif mnemonic == "MULR":
-            self.set_register(
-                name2,
-                s24(self.get_register(name2)) * s24(self.get_register(name1)),
-            )
+            self.set_register(name2, s24(self.get_register(name2)) * s24(self.get_register(name1)))
         elif mnemonic == "DIVR":
-            quotient = _trunc_div(
-                s24(self.get_register(name2)),
-                s24(self.get_register(name1)),
-            )
-            self.set_register(name2, quotient)
+            self.set_register(name2, _trunc_div(s24(self.get_register(name2)), s24(self.get_register(name1))))
         elif mnemonic == "COMPR":
             self._set_cc_signed(self.get_register(name1), self.get_register(name2))
         elif mnemonic == "SHIFTL":
             count = r2 + 1
             value = self.get_register(name1)
-            rotated = ((value << count) | (value >> (WORD_BITS - count))) & WORD_MASK
-            self.set_register(name1, rotated)
+            self.set_register(name1, ((value << count) | (value >> (WORD_BITS - count))) & WORD_MASK)
         elif mnemonic == "SHIFTR":
-            count = r2 + 1
-            self.set_register(name1, s24(self.get_register(name1)) >> count)
+            self.set_register(name1, s24(self.get_register(name1)) >> (r2 + 1))
         elif mnemonic == "TIXR":
             self.set_register("X", self.get_register("X") + 1)
             self._set_cc_signed(self.get_register("X"), self.get_register(name1))
         else:
             raise ExecutionTrap(f"unsupported format-2 instruction {mnemonic}", pc=pc)
-        return next_pc, stop_reason, service_code
+        return next_pc, None, None
 
     def _execute_format34(self, mnemonic, raw, pc, next_pc, writes):
         if mnemonic == "RSUB":
@@ -559,51 +474,23 @@ class SicXeMachine:
                 return 0, "return-zero", None
             self._check_address(target, pc, "RSUB target")
             return target, None, None
-
         operand = self._address_operand(raw, pc, next_pc)
-
         if mnemonic in {"LDA", "LDB", "LDL", "LDS", "LDT", "LDX"}:
-            target_register = mnemonic[2:]
-            self.set_register(target_register, self._operand_word(operand, pc))
+            self.set_register(mnemonic[2:], self._operand_word(operand, pc))
         elif mnemonic == "LDCH":
-            byte = self._operand_byte(operand, pc)
-            self.set_register("A", (self.get_register("A") & 0xFFFF00) | byte)
+            self.set_register("A", (self.get_register("A") & 0xFFFF00) | self._operand_byte(operand, pc))
         elif mnemonic in {"STA", "STB", "STL", "STS", "STT", "STX"}:
-            source_register = mnemonic[2:]
-            self._write_word(
-                self._store_address(operand, pc),
-                self.get_register(source_register),
-                writes,
-            )
+            self._write_word(self._store_address(operand, pc), self.get_register(mnemonic[2:]), writes)
         elif mnemonic == "STCH":
-            self._write_byte(
-                self._store_address(operand, pc),
-                self.get_register("A") & 0xFF,
-                writes,
-            )
+            self._write_byte(self._store_address(operand, pc), self.get_register("A") & 0xFF, writes)
         elif mnemonic == "ADD":
-            self.set_register(
-                "A",
-                s24(self.get_register("A")) + s24(self._operand_word(operand, pc)),
-            )
+            self.set_register("A", s24(self.get_register("A")) + s24(self._operand_word(operand, pc)))
         elif mnemonic == "SUB":
-            self.set_register(
-                "A",
-                s24(self.get_register("A")) - s24(self._operand_word(operand, pc)),
-            )
+            self.set_register("A", s24(self.get_register("A")) - s24(self._operand_word(operand, pc)))
         elif mnemonic == "MUL":
-            self.set_register(
-                "A",
-                s24(self.get_register("A")) * s24(self._operand_word(operand, pc)),
-            )
+            self.set_register("A", s24(self.get_register("A")) * s24(self._operand_word(operand, pc)))
         elif mnemonic == "DIV":
-            self.set_register(
-                "A",
-                _trunc_div(
-                    s24(self.get_register("A")),
-                    s24(self._operand_word(operand, pc)),
-                ),
-            )
+            self.set_register("A", _trunc_div(s24(self.get_register("A")), s24(self._operand_word(operand, pc))))
         elif mnemonic == "AND":
             self.set_register("A", self.get_register("A") & self._operand_word(operand, pc))
         elif mnemonic == "OR":
@@ -632,18 +519,16 @@ class SicXeMachine:
             if mnemonic == "TD":
                 self.cc = CC_LT if self.devices.test(device_id) else CC_EQ
             elif mnemonic == "RD":
-                byte = self.devices.read(device_id)
-                self.set_register("A", (self.get_register("A") & 0xFFFF00) | byte)
+                self.set_register("A", (self.get_register("A") & 0xFFFF00) | self.devices.read(device_id))
             else:
                 self.devices.write(device_id, self.get_register("A") & 0xFF)
         else:
             raise ExecutionTrap(f"unsupported format-3/4 instruction {mnemonic}", pc=pc)
-
         return next_pc, None, None
 
     @staticmethod
     def _register_snapshot(registers):
-        return {name: value for name, value in registers.items()}
+        return dict(registers)
 
     @staticmethod
     def _register_changes(before, after):
@@ -653,67 +538,61 @@ class SicXeMachine:
             if before[name] != after[name]
         )
 
+    def _rollback(self, registers, cc, writes, device_snapshot):
+        self.registers.clear()
+        self.registers.update(registers)
+        self.cc = cc
+        for address, before, _after in reversed(writes):
+            self.memory[address] = before
+        self.devices.restore(device_snapshot)
+
     def step(self, index=1):
         pc = self.get_register("PC")
         decoded, raw = self._fetch(pc)
         mnemonic = _base_mnemonic(decoded.mnemonic)
         before = self._register_snapshot(self.registers)
         cc_before = self.cc
+        device_snapshot = self.devices.snapshot()
         writes = []
         next_pc = pc + len(raw)
         stop_reason = None
         service_code = None
-
         try:
             if len(raw) == 1:
                 if mnemonic not in SUPPORTED_FORMAT1:
                     raise ExecutionTrap(
-                        f"instruction {mnemonic} is outside the implemented execution profile",
-                        pc=pc,
+                        f"instruction {mnemonic} is outside the implemented execution profile", pc=pc
                     )
             elif len(raw) == 2:
                 if mnemonic not in SUPPORTED_FORMAT2:
                     raise ExecutionTrap(
-                        f"instruction {mnemonic} is outside the implemented execution profile",
-                        pc=pc,
+                        f"instruction {mnemonic} is outside the implemented execution profile", pc=pc
                     )
-                next_pc, stop_reason, service_code = self._execute_format2(
-                    mnemonic, raw, pc, next_pc
-                )
+                next_pc, stop_reason, service_code = self._execute_format2(mnemonic, raw, pc, next_pc)
             else:
                 if mnemonic not in SUPPORTED_FORMAT34:
                     raise ExecutionTrap(
-                        f"instruction {mnemonic} is outside the implemented execution profile",
-                        pc=pc,
+                        f"instruction {mnemonic} is outside the implemented execution profile", pc=pc
                     )
                 next_pc, stop_reason, service_code = self._execute_format34(
                     mnemonic, raw, pc, next_pc, writes
                 )
-
             if stop_reason == "return-zero":
                 self.registers["PC"] = 0
             else:
                 self.set_register("PC", next_pc)
         except ExecutionTrap as exc:
+            self._rollback(before, cc_before, writes, device_snapshot)
             if exc.pc is None:
-                exc.pc = pc
+                raise ExecutionTrap(str(exc), pc=pc) from exc
             raise
-
         after = self._register_snapshot(self.registers)
         return ExecutionStep(
-            index=index,
-            pc=pc,
-            next_pc=self.get_register("PC"),
-            bytes_hex=raw.hex().upper(),
-            mnemonic=decoded.mnemonic,
-            operand=decoded.operand,
-            register_changes=self._register_changes(before, after),
-            memory_writes=tuple(writes),
-            cc_before=cc_before,
-            cc_after=self.cc,
-            stop_reason=stop_reason,
-            service_code=service_code,
-            context=self.context_at(pc),
+            index=index, pc=pc, next_pc=self.get_register("PC"),
+            bytes_hex=raw.hex().upper(), mnemonic=decoded.mnemonic,
+            operand=decoded.operand, register_changes=self._register_changes(before, after),
+            memory_writes=tuple(writes), cc_before=cc_before, cc_after=self.cc,
+            stop_reason=stop_reason, service_code=service_code, context=self.context_at(pc),
         )
 
     def run(self, max_steps=100000, breakpoints=(), trace=False):
@@ -721,44 +600,35 @@ class SicXeMachine:
             raise ValueError("max_steps must be non-negative")
         breakpoint_set = set(breakpoints)
         steps = []
+        executed = 0
         service_code = None
         breakpoint = None
         error = None
         stop_reason = "step-limit"
-
-        for index in range(1, max_steps + 1):
+        while executed < max_steps:
             pc = self.get_register("PC")
             if pc in breakpoint_set:
                 stop_reason = "breakpoint"
                 breakpoint = pc
                 break
             try:
-                step = self.step(index=index)
+                step = self.step(index=executed + 1)
             except ExecutionTrap as exc:
                 stop_reason = "trap"
                 error = str(exc)
                 break
+            executed += 1
             if trace:
                 steps.append(step)
             if step.stop_reason is not None:
                 stop_reason = step.stop_reason
                 service_code = step.service_code
                 break
-        else:
-            if max_steps == 0:
-                stop_reason = "step-limit"
-
         return ExecutionResult(
-            stop_reason=stop_reason,
-            steps=tuple(steps),
-            executed_steps=(steps[-1].index if steps else (0 if stop_reason == "breakpoint" else min(max_steps, 0))),
-            pc=self.get_register("PC"),
-            registers=self._register_snapshot(self.registers),
-            cc=self.cc,
-            service_code=service_code,
-            breakpoint=breakpoint,
-            error=error,
-            device_outputs=self.devices.outputs(),
+            stop_reason=stop_reason, steps=tuple(steps), executed_steps=executed,
+            pc=self.get_register("PC"), registers=self._register_snapshot(self.registers),
+            cc=self.cc, service_code=service_code, breakpoint=breakpoint,
+            error=error, device_outputs=self.devices.outputs(),
         )
 
 
@@ -772,10 +642,8 @@ def resolve_breakpoint(token, debug_map=None):
         if not 0 <= address <= SICXE_MAX_ADDRESS:
             raise ValueError(f"Breakpoint outside SIC/XE memory: {text}")
         return address
-
     if debug_map is None:
         raise ValueError(f"Symbol breakpoint requires linked debug metadata: {text}")
-
     matches = []
     for section in debug_map.get("sections", ()):
         if section.get("name") == text:
@@ -805,18 +673,13 @@ def result_to_dict(result):
         "device_outputs": dict(result.device_outputs),
         "steps": [
             {
-                "index": step.index,
-                "pc": step.pc,
-                "next_pc": step.next_pc,
-                "bytes_hex": step.bytes_hex,
-                "mnemonic": step.mnemonic,
+                "index": step.index, "pc": step.pc, "next_pc": step.next_pc,
+                "bytes_hex": step.bytes_hex, "mnemonic": step.mnemonic,
                 "operand": step.operand,
                 "register_changes": [list(change) for change in step.register_changes],
                 "memory_writes": [list(write) for write in step.memory_writes],
-                "cc_before": step.cc_before,
-                "cc_after": step.cc_after,
-                "stop_reason": step.stop_reason,
-                "service_code": step.service_code,
+                "cc_before": step.cc_before, "cc_after": step.cc_after,
+                "stop_reason": step.stop_reason, "service_code": step.service_code,
                 "context": _jsonable(step.context),
             }
             for step in result.steps
@@ -843,13 +706,9 @@ def _context_text(context):
         parts.append(f"invocation={invocation_line}")
     stack = provenance.get("macro_stack") or ()
     if stack:
-        parts.append(
-            "macro="
-            + ">".join(
-                f"{frame.get('name')}#{frame.get('instance')}"
-                for frame in stack
-            )
-        )
+        parts.append("macro=" + ">".join(
+            f"{frame.get('name')}#{frame.get('instance')}" for frame in stack
+        ))
         body_line = stack[-1].get("body_line")
         if body_line is not None:
             parts.append(f"definition={body_line}")
@@ -863,23 +722,17 @@ def render_step(step):
     if context:
         details.append(context)
     if step.register_changes:
-        details.append(
-            "regs="
-            + ",".join(
-                f"{name}:{before:06X}->{after:06X}"
-                for name, before, after in step.register_changes
-            )
-        )
+        details.append("regs=" + ",".join(
+            f"{name}:{before:06X}->{after:06X}"
+            for name, before, after in step.register_changes
+        ))
     if step.cc_before != step.cc_after:
         details.append(f"cc={step.cc_before}->{step.cc_after}")
     if step.memory_writes:
-        details.append(
-            "mem="
-            + ",".join(
-                f"{address:05X}:{before:02X}->{after:02X}"
-                for address, before, after in step.memory_writes
-            )
-        )
+        details.append("mem=" + ",".join(
+            f"{address:05X}:{before:02X}->{after:02X}"
+            for address, before, after in step.memory_writes
+        ))
     if step.stop_reason:
         stop = step.stop_reason
         if step.service_code is not None:
