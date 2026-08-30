@@ -16,7 +16,9 @@ For normal use, `sicxe.py` exposes the complete workflow through one command sur
 python sicxe.py assemble program.asm
 ```
 
-Assembly keeps the existing fail-closed output policy: stale generated files are removed before work begins and partial outputs are removed if macro expansion, Pass 1, Pass 2, object canonicalization, address-space checks, overlap checks, or generated-object semantic validation fails.
+Assembly keeps the existing fail-closed output policy: stale generated files are removed before work begins and partial outputs are removed if macro expansion, Pass 1, Pass 2, object canonicalization, address-space checks, overlap checks, generated-object semantic validation, or source-map generation fails.
+
+Alongside `.expanded.asm/.int/.sym/.obj/.lst`, successful assembly emits `program.sourcemap.json`. The sidecar is path-independent, bound to the exact canonical object SHA, and records final typed source regions plus expanded-source line/symbol provenance.
 
 ## Link
 
@@ -27,13 +29,16 @@ python sicxe.py link main.obj io.obj math.obj --progaddr 8000
 
 `--progaddr` is hexadecimal. The default remains `4000` for compatibility with the standalone loader.
 
-One successful link emits three persistent artifacts beside the first object input:
+One successful link emits four persistent artifacts beside the first object input:
 
 - `.map` — human-readable section layout, ESTAB, cross-references, relocation arithmetic, provenance, INPUTSET, and LINKID;
 - `.bin` — exact contiguous linked image for `[PROGADDR, PROGADDR + total_length)` after relocation;
-- `.manifest.json` — canonical, path-independent output attestation containing the image SHA-256, ordered object hashes, section layout, entry point, INPUTSET, and LINKID.
+- `.manifest.json` — canonical, path-independent output attestation containing the image SHA-256, ordered object hashes, section layout, entry point, INPUTSET, and LINKID;
+- `.debug.json` — LINKID-bound, path-independent linked source/debug metadata with rebased typed regions, loaded symbols, and a separate DEBUGID.
 
-The legacy `loader.py` parser is now strict. Unknown/unreadable object arguments and multiple positional PROGADDR values are usage errors instead of being silently ignored or overwritten.
+For each object input, the linker auto-detects an adjacent `.sourcemap.json`. Missing source maps are legal and produce an untyped section. Present source maps are trusted only after self-fingerprint, object-SHA, and section-layout validation; a stale sidecar fails the link instead of silently attaching incorrect provenance.
+
+The legacy `loader.py` parser remains strict. Unknown/unreadable object arguments and multiple positional PROGADDR values are usage errors instead of being silently ignored or overwritten.
 
 ## Verify
 
@@ -42,7 +47,7 @@ python sicxe.py verify program.bin program.manifest.json program.obj
 python verify_link.py program.bin program.manifest.json program.obj
 ```
 
-Verification does not trust a previous `.map` or an earlier in-memory load plan. It independently:
+Verification does not trust a previous `.map`, `.debug.json`, or earlier in-memory load plan. It independently:
 
 1. reads the binary and canonical JSON manifest;
 2. verifies the manifest schema and binary SHA-256;
@@ -54,39 +59,58 @@ Verification does not trust a previous `.map` or an earlier in-memory load plan.
 8. reconstructs the expected manifest and requires semantic equality;
 9. requires the persisted JSON bytes to equal the canonical deterministic serialization.
 
-This detects binary tampering, substituted/reordered object inputs, changed PROGADDR/link identity, modified manifest metadata, and noncanonical manifest serialization.
+This executable reproducibility proof intentionally does not require source/debug maps. DEBUGID is a separate metadata identity from LINKID.
 
 ## Inspect
 
 ```text
 python sicxe.py inspect program.obj
 python sicxe.py inspect program.obj --disassemble
-python sicxe.py inspect program.obj --json
+python sicxe.py inspect program.sourcemap.json
+python sicxe.py inspect program.debug.json
 python sicxe.py inspect program.manifest.json
+python sicxe.py inspect program.debug.json --json
 ```
 
-Object inspection runs the same structural/semantic object analyzer as the loader before displaying CSECT, D/R/T/M/E, raw SHA-256, text bytes, relocation sites, and entry data. `--disassemble` linear-sweeps T-record payloads and attaches overlapping M records to decoded instructions/data fields.
+Object inspection runs the same structural/semantic object analyzer as the loader before displaying CSECT, D/R/T/M/E, raw SHA-256, text bytes, relocation sites, and entry data. `--disassemble` linear-sweeps T-record payloads and attaches overlapping M records.
 
-Manifest inspection shows PROGADDR, image range/SHA, INPUTSET, LINKID, input identities, section placement, and entry provenance. If the adjacent `.bin` exists it is auto-detected and its current length/SHA are compared against the manifest. Use `--image` to select a different binary explicitly.
+Source-map inspection displays MAPID, object/source hashes, final source-address typed regions, expanded-source lines, and symbols. If the adjacent `.obj` exists, its current SHA is checked against the sidecar.
 
-`--json` exposes object/manifest inspection as machine-readable structured output.
+Linked-debug inspection displays LINKID, DEBUGID, loaded CSECT ranges, typed/untyped status, rebased regions, and loaded symbols.
 
-Inspection explains persisted state; it intentionally does not replace `verify`, which independently re-links the supplied object inputs.
+Manifest inspection shows PROGADDR, image range/SHA, INPUTSET, LINKID, input identities, section placement, and entry provenance. If the adjacent `.bin` exists it is auto-detected and its current length/SHA are compared against the manifest.
+
+`--json` exposes every inspection report as machine-readable structured output.
+
+Inspection explains persisted state; it intentionally does not replace `verify`, which independently re-links object inputs.
 
 ## Disassemble
 
 ```text
-python sicxe.py disasm program.bin --start 4000
 python sicxe.py disasm program.bin --manifest program.manifest.json
 python sicxe.py disasm program.bin --manifest program.manifest.json --base 8000
 python sicxe.py disasm program.bin --manifest program.manifest.json --offset 32 --length 64
+python sicxe.py disasm program.bin --manifest program.manifest.json --linear
 ```
 
-The disassembler decodes SIC/XE formats 1–4, format-2 operand signatures, `nixbpe`, addressing prefixes, PC-relative targets, optional base-relative targets, indexed addressing, and format-4 20-bit targets. Unknown/truncated bytes fall back to one-byte `.BYTE` records so linear sweep remains deterministic.
+When an adjacent `.debug.json` exists, source-aware rendering is the default. The debug LINKID must match the manifest and its PROGADDR must match the image origin.
 
-When a manifest is supplied, its `image_start` becomes the disassembly origin. Supplying a conflicting `--start` is a hard error.
+Typed regions render according to assembler intent:
 
-Flat SIC/XE images do not carry a general code/data map, so disassembly is deliberately described as linear sweep rather than source reconstruction. Valid data bytes can resemble valid instructions. See [`inspection-disassembly.md`](inspection-disassembly.md) for the exact contract and limitations.
+- instructions are decoded;
+- `WORD` becomes `.WORD`;
+- `BYTE` becomes `.BYTE`;
+- literal pools become `.LITERAL`;
+- reservations become `.RESB` metadata;
+- exact loaded symbol starts become labels;
+- instruction targets matching known symbols get `target_symbol=`;
+- expanded-source line provenance is printed.
+
+CSECTs from third-party objects without source-map sidecars fall back to the raw linear decoder. `--linear` forces raw decoding for the entire image even when debug metadata is available.
+
+The underlying decoder handles formats 1–4, original SIC compatibility mode, format-2 operand signatures, `nixbpe`, addressing prefixes, PC-relative targets, optional base-relative targets, indexed addressing, and format-4 20-bit targets. Unknown/truncated bytes fall back to one-byte `.BYTE` records.
+
+See [`inspection-disassembly.md`](inspection-disassembly.md) and [`source-maps.md`](source-maps.md) for the exact typed/untyped contracts.
 
 ## Expression language
 
