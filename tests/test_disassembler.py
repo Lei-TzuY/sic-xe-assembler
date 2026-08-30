@@ -1,6 +1,7 @@
 import unittest
 
 from disassembler import decode_instruction, disassemble, render_disassembly
+from opcodes import OPCODES
 
 
 class DisassemblerTests(unittest.TestCase):
@@ -51,6 +52,36 @@ class DisassemblerTests(unittest.TestCase):
         self.assertIsNone(unresolved_base.target)
         self.assertEqual(resolved_base.operand, "08345")
         self.assertEqual(resolved_base.target, 0x8345)
+
+    def test_decodes_original_sic_compatibility_address_without_xe_flag_confusion(self):
+        decoded = decode_instruction(bytes.fromhex("009234"), 0x2000)
+
+        self.assertEqual(decoded.mnemonic, "LDA")
+        self.assertEqual(decoded.size, 3)
+        self.assertEqual(decoded.operand, "01234,X")
+        self.assertEqual(decoded.target, 0x1234)
+        self.assertEqual(decoded.flags, "001---")
+        self.assertIn("SIC compatibility", decoded.warning)
+
+    def test_every_opcode_table_entry_round_trips_through_decoder(self):
+        for mnemonic, (encoded, fmt) in OPCODES.items():
+            opcode = int(encoded, 16)
+            with self.subTest(mnemonic=mnemonic, format=fmt):
+                if fmt == 1:
+                    decoded = decode_instruction(bytes([opcode]))
+                    self.assertEqual(decoded.mnemonic, mnemonic)
+                    self.assertEqual(decoded.format, 1)
+                elif fmt == 2:
+                    decoded = decode_instruction(bytes([opcode, 0]))
+                    self.assertEqual(decoded.mnemonic, mnemonic)
+                    self.assertEqual(decoded.format, 2)
+                else:
+                    decoded = decode_instruction(bytes([opcode | 0x03, 0, 0]))
+                    extended = decode_instruction(bytes([opcode | 0x03, 0x10, 0, 0]))
+                    self.assertEqual(decoded.mnemonic, mnemonic)
+                    self.assertEqual(decoded.format, 3)
+                    self.assertEqual(extended.mnemonic, "+" + mnemonic)
+                    self.assertEqual(extended.format, 4)
 
     def test_unknown_or_truncated_bytes_fall_back_without_losing_sync(self):
         records = disassemble(bytes.fromhex("FFB4104B"), start_address=0x3000)
