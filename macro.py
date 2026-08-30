@@ -1,4 +1,8 @@
 from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
 import re
 
 from errors import AssemblyError
@@ -7,6 +11,7 @@ from pass1 import parse_line
 
 PARAMETER_RE = re.compile(r"&[A-Za-z_][A-Za-z0-9_]*")
 LOCAL_LABEL_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+MACRO_PROVENANCE_SCHEMA = "sicxe-macro-provenance-v1"
 
 
 @dataclass(frozen=True)
@@ -19,6 +24,35 @@ class MacroDefinition:
 
 def _fail(line_number, message):
     raise AssemblyError(message, phase="macro", line_number=line_number)
+
+
+def default_macro_provenance_path(expanded_path):
+    return str(Path(expanded_path).with_suffix(".provenance.json"))
+
+
+def _canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _fingerprint_provenance(value):
+    digest = hashlib.sha256()
+    digest.update(b"SICXE-MACRO-PROVENANCE-v1\0")
+    digest.update(_canonical_json(value))
+    return digest.hexdigest()
+
+
+def _write_atomic_text(path, text):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _split_arguments(operand):
@@ -194,7 +228,26 @@ def _collect_definition(lines, start_index, macros):
     _fail(line_number, f"Unterminated MACRO definition: {label}")
 
 
-def _expand_macro(definition, label, operand, line_number, macros, counter, stack):
+def _provenance(kind, source_line, root_invocation_line, macro_stack):
+    return {
+        "kind": kind,
+        "source_line": source_line,
+        "invocation_line": root_invocation_line,
+        "macro_stack": tuple(macro_stack),
+    }
+
+
+def _expand_macro(
+    definition,
+    label,
+    operand,
+    line_number,
+    macros,
+    counter,
+    stack,
+    trace_stack=None,
+    root_invocation_line=None,
+):
     if definition.name in stack:
         chain = " -> ".join(stack + [definition.name])
         _fail(line_number, f"Recursive macro expansion detected: {chain}")
@@ -213,18 +266,49 @@ def _expand_macro(definition, label, operand, line_number, macros, counter, stac
 
     replacements = dict(zip(definition.parameters, arguments))
     counter[0] += 1
-    local_prefix = f"__{definition.name}_{counter[0]:04d}_"
-    expanded = [f". Macro Expansion: {definition.name}"]
+    instance = counter[0]
+    local_prefix = f"__{definition.name}_{instance:04d}_"
+    trace_stack = list(trace_stack or ())
+    root_invocation_line = line_number if root_invocation_line is None else root_invocation_line
+    scope_frame = {
+        "name": definition.name,
+        "instance": instance,
+        "definition_line": definition.line_number,
+        "invocation_line": line_number,
+        "body_line": None,
+    }
+    expanded = [
+        {
+            "text": f". Macro Expansion: {definition.name}",
+            "provenance": _provenance(
+                "macro-marker",
+                line_number,
+                root_invocation_line,
+                trace_stack + [scope_frame],
+            ),
+        }
+    ]
 
-    # Preserve the historical standalone invocation label so existing fixtures and
-    # pass-1 label semantics remain stable.
     if label:
-        expanded.append(label)
+        expanded.append(
+            {
+                "text": label,
+                "provenance": _provenance(
+                    "macro-invocation-label",
+                    line_number,
+                    root_invocation_line,
+                    trace_stack + [scope_frame],
+                ),
+            }
+        )
 
     next_stack = stack + [definition.name]
     for body_line, body_line_number in definition.body:
         substituted = _substitute_line(body_line, replacements, local_prefix)
         nested_label, nested_opcode, nested_operand, is_comment = parse_line(substituted)
+        body_frame = dict(scope_frame)
+        body_frame["body_line"] = body_line_number
+        line_trace = trace_stack + [body_frame]
 
         if not is_comment and nested_opcode in macros:
             expanded.extend(
@@ -236,18 +320,81 @@ def _expand_macro(definition, label, operand, line_number, macros, counter, stac
                     macros,
                     counter,
                     next_stack,
+                    trace_stack=line_trace,
+                    root_invocation_line=root_invocation_line,
                 )
             )
         else:
-            expanded.append(substituted)
+            expanded.append(
+                {
+                    "text": substituted,
+                    "provenance": _provenance(
+                        "macro-body",
+                        body_line_number,
+                        root_invocation_line,
+                        line_trace,
+                    ),
+                }
+            )
 
     return expanded
 
 
-def run_macro_processor(input_asm, output_asm):
-    """Expand SIC/XE macros with validated parameters and deterministic local labels."""
+def _write_provenance(input_asm, output_asm, entries, provenance_path):
+    source_bytes = Path(input_asm).read_bytes()
+    expanded_bytes = Path(output_asm).read_bytes()
+    lines = []
+    for index, item in enumerate(entries, 1):
+        line = dict(item)
+        line["expanded_line"] = index
+        lines.append(line)
+    payload = {
+        "schema": MACRO_PROVENANCE_SCHEMA,
+        "original_source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "expanded_source_sha256": hashlib.sha256(expanded_bytes).hexdigest(),
+        "lines": lines,
+    }
+    payload["macro_provenance_fingerprint"] = _fingerprint_provenance(payload)
+    _write_atomic_text(
+        provenance_path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
+    return payload
+
+
+def load_macro_provenance(path, expanded_sha256=None):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid macro provenance {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != MACRO_PROVENANCE_SCHEMA:
+        raise ValueError("Unsupported macro provenance schema")
+    required = (
+        "original_source_sha256",
+        "expanded_source_sha256",
+        "lines",
+        "macro_provenance_fingerprint",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError("Macro provenance missing required field(s): " + ", ".join(missing))
+    unsigned = dict(payload)
+    fingerprint = unsigned.pop("macro_provenance_fingerprint")
+    if fingerprint != _fingerprint_provenance(unsigned):
+        raise ValueError("Macro provenance fingerprint mismatch")
+    if expanded_sha256 is not None and payload["expanded_source_sha256"] != expanded_sha256:
+        raise ValueError("Macro provenance does not match expanded source bytes")
+    for expected_line, item in enumerate(payload["lines"], 1):
+        if item.get("expanded_line") != expected_line:
+            raise ValueError("Macro provenance line numbers must be contiguous and ordered")
+    return payload
+
+
+def run_macro_processor(input_asm, output_asm, provenance_path=None):
+    """Expand macros and optionally persist path-independent line provenance."""
     macros = {}
     counter = [0]
+    provenance_entries = []
 
     with open(input_asm, 'r') as f_in:
         lines = f_in.readlines()
@@ -276,9 +423,22 @@ def run_macro_processor(input_asm, output_asm):
                     counter,
                     [],
                 )
-                for expanded_line in expanded:
-                    f_out.write(expanded_line + "\n")
+                for item in expanded:
+                    f_out.write(item["text"] + "\n")
+                    provenance_entries.append(item["provenance"])
             else:
                 f_out.write(line)
+                provenance_entries.append(
+                    _provenance("source", line_number, None, ())
+                )
 
             index += 1
+
+    if provenance_path is not None:
+        return _write_provenance(
+            input_asm,
+            output_asm,
+            provenance_entries,
+            provenance_path,
+        )
+    return None
