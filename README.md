@@ -1,28 +1,75 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, forward `EQU`, `ORG`, object-program contract validation, assembler semantic checks, and a linking loader.
+A dependency-free Python implementation of a SIC/XE macro assembler and linking loader, with unusually strict semantic validation, deterministic linking, reproducible output artifacts, and independent artifact verification.
 
-## Run the assembler
+The project started as a conventional two-pass assembler and now covers the complete SIC/XE instruction table, macros, literals, program blocks, control sections, relocation expressions, a validated load-plan model, a 1 MiB machine-memory model, persistent link maps, deterministic linked images, and end-to-end reproducibility checks.
+
+## Quick start
+
+Use the unified CLI for new workflows:
 
 ```powershell
-python assembler.py test_xe.asm
+python sicxe.py assemble program.asm
+python sicxe.py link program.obj --progaddr 4000
+python sicxe.py verify program.bin program.manifest.json program.obj
 ```
 
-For `program.asm`, the assembler writes `program.expanded.asm`, `program.int`, `program.sym`, `program.obj`, and `program.lst` beside the source file.
+The historical entry points remain supported:
 
-Object-program names used by control sections, `EXTDEF`, and `EXTREF` must fit the SIC/XE six-character fixed field: 1–6 ASCII alphanumeric characters beginning with a letter. Duplicate or colliding external namespaces are rejected instead of being silently truncated. Large D/R records are split to the standard 73-character record bound, and generated H/D/R/T/M/E framing is validated before assembly succeeds.
+```powershell
+python assembler.py program.asm
+python loader.py program.obj 4000
+python verify_link.py program.bin program.manifest.json program.obj
+```
 
-After Pass 1 has assigned final program-block addresses, the assembler checks initialized storage for overlap. Instructions, `WORD`, `BYTE`, and emitted literal bytes may not overwrite earlier initialized bytes, even after `ORG` moves LOCCTR backward. `RESB`/`RESW` remain reservations rather than initialized storage, so the conventional pattern of using `ORG` to define fields inside a reserved buffer remains valid. After Pass 2, the generated object file is also run through the same semantic analyzer used by the loader; an object file that the loader would reject can therefore never be reported as a successful assembly.
+No third-party runtime packages are required.
 
-## Address-space model
+## What is implemented
 
-SIC/XE machine memory is 20-bit: `0x00000`–`0xFFFFF` (1 MiB). The six hexadecimal digits used by H/D/T/M/E records are a 24-bit **serialization field**, not a 16 MiB machine-memory declaration. `START`, finalized control-section placement, loader `PROGADDR`, and linked-image placement all obey the 20-bit machine limit, while 24-bit `WORD` data remains independent. See [`docs/address-space.md`](docs/address-space.md) for the precise contract, including one-past-end boundary symbols.
+| Area | Support |
+| --- | --- |
+| Instructions | Complete SIC/XE instruction table; formats 1, 2, 3, and 4 |
+| Addressing | immediate, indirect, indexed, PC-relative, base-relative, extended |
+| Macros | parameters, quoted arguments, nested expansion, recursion detection, unique local labels |
+| Literals | `=C'..'`, `=X'..'`, deduplication, `LTORG`, automatic pool flush |
+| Expressions | parentheses, unary `+/-`, `*`/`/` precedence, relocation-aware `+/-` |
+| Symbols | `EQU`, forward `EQU` dependencies, cycle detection, `*` current location |
+| Layout | `ORG`, `USE` program blocks, independent block LOCCTRs, high-water lengths |
+| Linking | `CSECT`, `EXTDEF`, `EXTREF`, D/R/M/E records, grouped relocation arithmetic |
+| Validation | fixed-field object contracts, initialized-storage overlap checks, shared object semantics |
+| Machine model | 20-bit SIC/XE address space / 1 MiB memory; independent 24-bit WORD values |
+| Reproducibility | immutable object snapshots, INPUTSET, LINKID, deterministic `.map/.bin/manifest` |
+| Verification | independent re-link and byte-for-byte artifact reproduction |
 
-## Macro processor
+## Assembly pipeline
 
-Macros use positional `&NAME` parameters and are validated before expansion. Arguments may contain quoted commas, macro bodies may invoke other macros, and recursive expansion is rejected. Labels beginning with `$` are macro-local and are rewritten to deterministic unique symbols for each expansion, so repeated invocations do not create duplicate assembler labels.
+For `program.asm`, assembly produces:
 
-Example:
+```text
+program.expanded.asm
+program.int
+program.sym
+program.obj
+program.lst
+```
+
+The successful pipeline is deliberately fail-closed:
+
+1. macro expansion;
+2. object-name/source-contract preflight;
+3. source START address validation;
+4. Pass 1 symbol/layout construction;
+5. finalized program-block/CSECT address validation;
+6. initialized-storage overlap detection;
+7. Pass 2 object generation;
+8. object-record canonicalization;
+9. generated-object semantic validation using the same analyzer as the loader.
+
+If any stage fails, stale and partial generated outputs are removed.
+
+### Macro processor
+
+Macros use positional `&NAME` parameters. Arguments may contain quoted commas, macro bodies may invoke other macros, recursive expansion is rejected, and `$LOCAL` labels are rewritten into deterministic unique labels for each invocation.
 
 ```asm
 SPIN     MACRO   &TARGET
@@ -31,103 +78,122 @@ $LOOP    LDA     &TARGET
          MEND
 ```
 
-Two `SPIN` invocations receive different expanded `$LOOP` symbols. Missing/extra arguments, duplicate or undeclared parameters, unexpected `MEND`, and unterminated definitions are hard assembly errors.
+### Literals and program blocks
 
-## Program blocks
+Format-3/4 operands may use `=C'..'` and `=X'..'` literals. Pools are deduplicated per CSECT and emitted by `LTORG`, `CSECT`, or `END`.
 
-`USE` switches among independent location counters inside one control section. The unnamed default block is laid out first; named blocks follow in first-seen order. Pass 1 records block-relative locations and rebases symbols, literals, and intermediate addresses only after all block lengths are known.
+`USE` gives each program block an independent location counter and `ORG` restore stack. Final block addresses are assigned only after Pass 1, with the unnamed block first and named blocks in first-seen order.
 
-```asm
-COPY     START   1000
-FIRST    LDA     TABLE
-         USE     DATA
-TABLE    RESW    16
-         USE     CODE
-ROUTINE  RSUB
-         USE
-NEXT     WORD    TABLE-FIRST
-         END     FIRST
-```
+### Expressions and relocation algebra
 
-`USE DATA` and `USE CODE` preserve the previous location of each block, while operand-less `USE` returns to the default block. Source order therefore does not need to match final memory order. Labels on a `USE` statement bind to the current block before the switch. Literal pools emitted by `LTORG` are placed in whichever block is active at that point. Each program block also owns an independent `ORG` restore stack.
+Expressions use normal precedence:
 
-## Literal pools
+1. parentheses;
+2. unary `+` / `-`;
+3. multiplication / division;
+4. addition / subtraction.
 
-Format 3/4 instructions may reference character and hexadecimal literals with `=C'..'` and `=X'..'`. Literals are deduplicated within each control section. `LTORG` emits all currently pending literals at the current location; any remaining literals are emitted automatically before `CSECT` or `END`.
+Examples:
 
 ```asm
-COPY     START   0
-         LDA     =C'EOF'
-         LDX     =C'EOF'
-         LTORG
-         LDCH    =X'F1'
-         END     COPY
+LENGTH   EQU     (BUFEND-BUFFER) * 4
+OFFSET   EQU     -(A-B) + 20
+VALUE    WORD    (LENGTH + 2) * 3
+MIX      WORD    EXT1 - (EXT2 - 12)
 ```
 
-The two `=C'EOF'` references share one pool entry. Literal addresses participate in normal PC/base-relative addressing, and format-4 literal references generate the same control-section relocation records as local symbols.
+`*` is the current location when used as a primary expression and multiplication when used between operands. Division truncates toward zero.
 
-## Expressions, forward EQU, and ORG
+Relocation rules remain strict: multiplication and division require absolute operands. Relocatable local symbols and external symbols may participate in additive algebra, but expressions such as `BUFFER*2` or `EXT1/4` are rejected because SIC/XE modification records cannot represent arbitrary scaled relocation terms.
 
-Assembler expressions support additive terms made from local symbols, `*`, decimal/hexadecimal integers, and `+` / `-`. Relocation legality follows SIC/XE relative-term algebra: `relative-relative` is absolute, `relative+absolute` remains relocatable, while expressions such as `relative+relative` or `absolute-relative` are rejected.
+Forward `EQU` definitions are resolved transitively after final program-block layout. Circular dependencies are rejected with the dependency path.
 
-`EQU` definitions may refer to local symbols or other `EQU` symbols that appear later in the same control section. Definitions that can be evaluated immediately remain available to following statements; unresolved forward definitions are completed after program-block layout, so their final values use rebased block addresses. Dependency chains are resolved transitively and circular definitions are rejected with the dependency path.
+## Object-program and address contracts
 
-```asm
-LENGTH   EQU     BUFEND-BUFFER
-PTR      EQU     BUFFER+3
-BUFFER   RESB    64
-BUFEND   EQU     *
+Object names used by control sections, `EXTDEF`, and `EXTREF` must fit the six-character SIC/XE fixed field: 1–6 ASCII alphanumeric characters beginning with a letter. D/R records are split to the standard record-length bound, and H/D/R/T/M/E framing is structurally validated.
+
+SIC/XE machine memory is 20-bit: `0x00000`–`0xFFFFF` (1 MiB). Six hexadecimal address digits in object records are a serialization field, not permission to address 16 MiB of machine memory. `START`, final section layout, `PROGADDR`, and linked-image placement obey the 20-bit limit; 24-bit `WORD` data remains independent.
+
+Initialized instructions, `WORD`, `BYTE`, and literal bytes may not overlap after final layout. `RESB`/`RESW` remain reservations, so using `ORG` to define initialized fields inside a reserved buffer remains legal.
+
+See [`docs/address-space.md`](docs/address-space.md).
+
+## Linking and relocation
+
+The loader first captures every object input exactly once into an immutable link session. It then validates and resolves the entire link before allocating or mutating SIC/XE memory.
+
+The load plan contains:
+
+- ordered object snapshots and raw SHA-256 digests;
+- complete CSECT placement;
+- ESTAB plus definition provenance;
+- resolved R/M references;
+- grouped exact relocation arithmetic;
+- unused-but-legal R declarations;
+- execution-entry provenance;
+- path-independent INPUTSET and PROGADDR-sensitive LINKID.
+
+Repeated M records over the exact same field are one relocation expression: all signed symbol deltas are summed with exact integers, then the final field is range-checked once and written once. Partially overlapping modification fields and mixed 5/6-half-byte fields over the same bytes are rejected as ambiguous.
+
+The loader allocates the full 1 MiB SIC/XE memory image. A normal `pass1() -> pass2()` API sequence binds the Pass-1 ESTAB to the immutable input session, removing file-reopen TOCTOU: changing or deleting an object file after Pass 1 cannot change the bytes materialized by that link operation.
+
+See [`docs/load-plan.md`](docs/load-plan.md) and [`docs/relocation-arithmetic.md`](docs/relocation-arithmetic.md).
+
+## Persistent linked artifacts
+
+A successful link emits three files beside the first object input:
+
+```text
+program.map
+program.bin
+program.manifest.json
 ```
 
-The example resolves `LENGTH` as an absolute value and `PTR` as relocatable even though both reference later symbols. Undefined symbols are reported at the original `EQU` line. Forward `EQU` does not make layout-changing directives speculative: an `ORG` expression must still be resolvable when the `ORG` statement is encountered.
+`program.map` is a deterministic human-readable link report containing CSECT layout, ESTAB, definition provenance, cross-references, unused R declarations, relocation sites/arithmetic, input hashes, INPUTSET, LINKID, and entry provenance.
 
-```asm
-         ORG     BUFFER+16
-FIELD    RESW    1
-         ORG
-```
+`program.bin` is the exact contiguous linked address range `[PROGADDR, PROGADDR + total_length)` after relocation. Reserved gaps inside that range are deterministic zero bytes.
 
-`ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. With program blocks, `ORG` must resolve within the currently active block. Block length uses the highest location reached, so moving LOCCTR backward cannot truncate the final block or H-record length. If a backward `ORG` causes new object-producing statements or a literal pool to overwrite already initialized bytes, assembly fails at the offending source line and reports the conflicting address range.
+`program.manifest.json` uses schema `sicxe-linked-image-v1` and attests the binary SHA-256, ordered input hashes, section layout, entry point, INPUTSET, and LINKID. It intentionally contains no host paths, so moving identical object bytes to another directory does not change the manifest.
 
-## External relocation expressions
+See [`docs/link-map.md`](docs/link-map.md) and [`docs/linked-image.md`](docs/linked-image.md).
 
-`WORD` and format-4 instructions may combine `EXTREF` symbols with constants and local relocatable terms. The assembler stores the section-relative/absolute part in the object field and emits one signed modification record for every deferred relocation term.
+## Independent artifact verification
 
-```asm
-         EXTREF  EXT1,EXT2
-FIRST    +LDA    EXT1+7
-DIFF     WORD    EXT1-EXT2+5
-MIX      WORD    FIRST+EXT1-EXT2
-```
-
-For `DIFF`, the initial WORD value is `5`, followed by `+EXT1` and `-EXT2` modification records. `MIX` additionally emits a `+<current CSECT>` modification for the local relocatable `FIRST` term. Format-3 instructions reject expressions containing external symbols because they cannot be resolved with 12-bit PC/base-relative addressing, and `BASE` likewise rejects external expressions.
-
-Relocatable object addends have an explicit interpretation so the loader never has to guess signedness: a 5-half-byte format-4 relocation field uses an unsigned 20-bit addend, while a 6-half-byte `WORD` relocation field uses a signed 24-bit two's-complement addend. The assembler rejects relocatable expressions that cannot be represented by those pre-link addend contracts.
-
-## Run the loader
+The verifier does not trust the previous `.map` or an earlier in-memory plan:
 
 ```powershell
-python loader.py program.obj 4000
+python sicxe.py verify program.bin program.manifest.json program.obj
 ```
 
-Object programs retain their assembled control-section origin. The loader translates H/T/M/E record addresses to the requested `PROGADDR`, so sources with a non-zero `START` address relocate correctly instead of being loaded at `PROGADDR + START`.
+It reads the persisted binary/manifest, captures the supplied objects again, recomputes INPUTSET/LINKID, rebuilds the complete load plan, re-applies relocation, rematerializes memory, and requires both the binary and canonical manifest to reproduce exactly.
 
-The loader allocates the full 1 MiB SIC/XE memory space. Before ESTAB construction or memory mutation, it validates the complete section semantics: H ranges must stay within 20-bit machine memory; D offsets may denote the one-past-end location but not beyond it; T records may arrive out of address order but may not overlap; every M field must lie inside the section, be fully backed by loaded T bytes, and name either the current control section or a symbol declared by R; execution addresses are end-exclusive for non-empty sections. `PROGADDR` and the aggregate placement of every linked control section are also range-checked before loading. Across all linked inputs only one explicit execution address is accepted, preventing later object files from silently overriding the program entry point.
+This detects binary tampering, substituted or reordered object inputs, manifest metadata changes, wrong PROGADDR/link identity, and noncanonical manifest serialization.
 
-Repeated M records that target the same field are treated as one relocation expression: all signed ESTAB deltas are summed using exact integers, the final 20-bit or 24-bit value is range-checked once, and only then is the field written. This prevents silent modular wraparound and makes the result independent of M-record order. Partially overlapping modification fields, or mixed 5/6-half-byte fields over the same bytes, are rejected as ambiguous.
+See [`docs/toolchain-cli.md`](docs/toolchain-cli.md).
 
-Before allocating or mutating SIC/XE memory, the loader builds one deterministic **load plan** for all input files. The plan fixes every control-section placement, the complete ESTAB with definition provenance, every relocation result, unused-but-legal R declaration, and the final execution entry point. Undefined external symbols, duplicate definitions, ambiguous multiple entry points, relocation range failures, and stale/tampered ESTABs therefore fail before loading begins. See [`docs/load-plan.md`](docs/load-plan.md) for the plan contract.
+## Testing
 
-A successful CLI link writes three persistent artifacts beside the first object input: `program.map`, `program.bin`, and `program.manifest.json`. The map contains CSECT layout, ESTAB provenance, symbol cross-references, unused R declarations, exact relocation arithmetic, source/load relocation addresses, and entry-point provenance. The binary contains exactly the final linked range `[PROGADDR, PROGADDR + total_length)`, including deterministic zero-filled reserved bytes. The path-independent manifest records INPUTSET/LINKID, input SHA-256 values, loaded section layout, entry provenance, and the SHA-256 of the exact binary image. Stale artifacts are removed before a link and after any failure. See [`docs/link-map.md`](docs/link-map.md) and [`docs/linked-image.md`](docs/linked-image.md) for the stable artifact contracts.
-
-## Verify the checked-in fixtures
+Run everything locally:
 
 ```powershell
+python -m compileall -q .
+python -m unittest discover -s tests -v
 python verify.py
 ```
 
-The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test_xe.asm` in a temporary directory and byte-compares all generated outputs with the checked-in golden files.
+`verify.py` assembles the four checked-in fixture programs in an isolated temporary directory and byte-compares `.expanded.asm`, `.int`, `.sym`, `.obj`, and `.lst` against the tracked golden outputs.
+
+GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 3.13. Byte-for-byte golden fixture verification runs on Linux, while the cross-platform matrix exercises filesystem behavior, atomic artifact writes, the unified CLI, linking, and reproducibility verification.
+
+## Documentation
+
+- [`docs/address-space.md`](docs/address-space.md) — machine vs object-field address model
+- [`docs/relocation-arithmetic.md`](docs/relocation-arithmetic.md) — 20/24-bit relocation addend contracts
+- [`docs/load-plan.md`](docs/load-plan.md) — deterministic planning and immutable link sessions
+- [`docs/link-map.md`](docs/link-map.md) — stable linker map / cross-reference format
+- [`docs/linked-image.md`](docs/linked-image.md) — binary image and manifest contract
+- [`docs/toolchain-cli.md`](docs/toolchain-cli.md) — unified CLI, verifier, and expression grammar
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, initialized-storage overlap diagnostics, 20-bit machine-address placement, exact grouped relocation arithmetic, deterministic link/load planning, immutable reproducible link sessions, persistent link-map/cross-reference reporting, deterministic linked-image binaries and manifests, external symbols, local/external relocation records, shared assembler/loader semantic validation, and loader relocation.
+This remains an educational SIC/XE implementation rather than a production-system linker, but correctness is treated as a first-class goal: malformed inputs fail hard, relocation is explicit, address-space limits are enforced, output provenance is recorded, and final linked artifacts can be independently reproduced and verified.
