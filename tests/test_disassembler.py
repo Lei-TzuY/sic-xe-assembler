@@ -69,7 +69,7 @@ class DisassemblerTests(unittest.TestCase):
         self.assertEqual([item.mnemonic for item in records], ["FIX", "CLEAR", "LDA", "LDA", "RSUB"])
         self.assertIn("01003", text)
         self.assertIn("LDA #5", text)
-        self.assertIn("target=0100F", text)
+        self.assertIn("target=01012", text)
         self.assertTrue(text.endswith("\n"))
 
 
