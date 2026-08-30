@@ -2,6 +2,12 @@ from errors import AssemblyError
 from expressions import evaluate_expression, evaluate_link_expression
 from opcodes import FORMAT2_SIGNATURES, OPCODES, REGISTERS
 from pass1 import encode_byte_operand, parse_line, parse_literal
+from relocation import (
+    FORMAT4_RELOCATION_HALF_BYTES,
+    WORD_RELOCATION_HALF_BYTES,
+    has_relocation_terms,
+    validate_object_addend,
+)
 
 
 def _parse_register(token):
@@ -343,7 +349,15 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                 fail(line_number, str(exc))
 
                             if e:
-                                if not -(1 << 19) <= link_result.value <= 0xFFFFF:
+                                if has_relocation_terms(link_result):
+                                    try:
+                                        validate_object_addend(
+                                            link_result.value,
+                                            FORMAT4_RELOCATION_HALF_BYTES,
+                                        )
+                                    except ValueError as exc:
+                                        fail(line_number, str(exc))
+                                elif not -(1 << 19) <= link_result.value <= 0xFFFFF:
                                     fail(
                                         line_number,
                                         f"Format-4 expression value out of 20-bit range: {link_result.value}",
@@ -351,7 +365,7 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                                 disp = link_result.value & 0xFFFFF
                                 append_link_modifications(
                                     current_pc + 1,
-                                    5,
+                                    FORMAT4_RELOCATION_HALF_BYTES,
                                     link_result,
                                 )
                             else:
@@ -414,10 +428,15 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                     fail(line_number, str(exc))
 
                 value = result.value
-                append_link_modifications(current_pc, 6, result)
-
-                if not -(1 << 23) <= value <= 0xFFFFFF:
+                if has_relocation_terms(result):
+                    try:
+                        validate_object_addend(value, WORD_RELOCATION_HALF_BYTES)
+                    except ValueError as exc:
+                        fail(line_number, str(exc))
+                elif not -(1 << 23) <= value <= 0xFFFFFF:
                     fail(line_number, f"WORD value out of 24-bit range: {value}")
+
+                append_link_modifications(current_pc, WORD_RELOCATION_HALF_BYTES, result)
                 if value < 0:
                     value = (1 << 24) + value
                 obj_code = f"{value:06X}"
