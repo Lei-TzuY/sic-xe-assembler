@@ -7,6 +7,13 @@ from pathlib import Path
 import assembler
 import loader
 from artifact_verifier import ArtifactVerificationError, verify_linked_artifacts
+from debug_analysis import (
+    build_control_flow_graph,
+    render_control_flow_graph,
+    render_debug_disassembly,
+    render_linked_debug_with_provenance,
+    render_source_map_with_provenance,
+)
 from disassembler import disassemble, render_disassembly
 from inspector import (
     InspectionError,
@@ -19,9 +26,6 @@ from source_map import (
     SourceMapError,
     load_linked_debug_map,
     load_source_map,
-    render_linked_debug_inspection,
-    render_source_map_inspection,
-    render_typed_disassembly,
 )
 
 
@@ -50,7 +54,7 @@ def build_parser():
         prog="sicxe.py",
         description=(
             "SIC/XE assembler, reproducible linker, artifact verifier, inspector, "
-            "and source-aware disassembler"
+            "source-aware disassembler, and control-flow analyzer"
         ),
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -127,6 +131,11 @@ def build_parser():
         help="ignore typed debug metadata and force the historical linear sweep",
     )
     disasm.add_argument(
+        "--blocks",
+        action="store_true",
+        help="annotate source-aware disassembly with CFG basic-block boundaries/successors",
+    )
+    disasm.add_argument(
         "--base",
         type=_parse_hex_address,
         metavar="HEX",
@@ -150,6 +159,37 @@ def build_parser():
         type=_parse_nonnegative_int,
         metavar="N",
         help="stop after at most N decoded instruction records",
+    )
+
+    cfg = subcommands.add_parser(
+        "cfg",
+        help="build conservative basic blocks and control-flow edges from typed debug metadata",
+    )
+    cfg.add_argument("image", help="raw linked .bin image")
+    cfg.add_argument(
+        "--manifest",
+        help="linked-image manifest (auto-detected beside the image when present)",
+    )
+    cfg.add_argument(
+        "--debug",
+        help="linked .debug.json source map (auto-detected beside the image when present)",
+    )
+    cfg.add_argument(
+        "--entry",
+        type=_parse_hex_address,
+        metavar="HEX",
+        help="override CFG entry address (otherwise manifest entry or PROGADDR)",
+    )
+    cfg.add_argument(
+        "--base",
+        type=_parse_hex_address,
+        metavar="HEX",
+        help="optional B-register value for resolving base-relative branch targets",
+    )
+    cfg.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the structured CFG as JSON",
     )
 
     return parser
@@ -224,7 +264,7 @@ def _run_inspect(args):
             output = (
                 json.dumps(report, indent=2, sort_keys=True) + "\n"
                 if args.json
-                else render_source_map_inspection(report)
+                else render_source_map_with_provenance(report)
             )
         elif artifact.endswith(".debug.json"):
             if args.disassemble or args.image or args.base is not None:
@@ -233,7 +273,7 @@ def _run_inspect(args):
             output = (
                 json.dumps(report, indent=2, sort_keys=True) + "\n"
                 if args.json
-                else render_linked_debug_inspection(report)
+                else render_linked_debug_with_provenance(report)
             )
         else:
             raise InspectionError(
@@ -259,7 +299,16 @@ def _default_debug_for_image(image_path):
     return str(candidate) if candidate.exists() else None
 
 
+def _default_manifest_for_image(image_path):
+    candidate = Path(image_path).with_suffix(".manifest.json")
+    return str(candidate) if candidate.exists() else None
+
+
 def _run_disasm(args):
+    if args.linear and args.blocks:
+        print("Disassembly failed: --blocks requires typed debug metadata; remove --linear", file=sys.stderr)
+        return 1
+
     try:
         image = Path(args.image).read_bytes()
     except OSError as exc:
@@ -319,8 +368,26 @@ def _run_disasm(args):
         return 1
 
     if debug_map is not None:
+        cfg = None
+        if args.blocks:
+            entry = (
+                manifest_report["entry"]["address"]
+                if manifest_report is not None
+                else debug_map["progaddr"]
+            )
+            try:
+                cfg = build_control_flow_graph(
+                    image,
+                    start,
+                    debug_map,
+                    entry_address=entry,
+                    base_register=args.base,
+                )
+            except SourceMapError as exc:
+                print(f"Disassembly failed: {exc}", file=sys.stderr)
+                return 1
         try:
-            output = render_typed_disassembly(
+            output = render_debug_disassembly(
                 image,
                 start,
                 debug_map,
@@ -328,12 +395,17 @@ def _run_disasm(args):
                 offset=offset,
                 length=args.length,
                 max_instructions=args.max_instructions,
+                cfg=cfg,
             )
         except SourceMapError as exc:
             print(f"Disassembly failed: {exc}", file=sys.stderr)
             return 1
         print(output, end="")
         return 0
+
+    if args.blocks:
+        print("Disassembly failed: --blocks requires a linked .debug.json", file=sys.stderr)
+        return 1
 
     end = len(image) if args.length is None else min(len(image), offset + args.length)
     payload = image[offset:end]
@@ -344,6 +416,74 @@ def _run_disasm(args):
         max_instructions=args.max_instructions,
     )
     print(render_disassembly(records), end="")
+    return 0
+
+
+def _run_cfg(args):
+    try:
+        image = Path(args.image).read_bytes()
+    except OSError as exc:
+        print(f"CFG failed: {exc}", file=sys.stderr)
+        return 1
+
+    manifest_path = args.manifest or _default_manifest_for_image(args.image)
+    manifest_report = None
+    if manifest_path:
+        try:
+            manifest_report = _manifest_report(manifest_path)
+        except ValueError as exc:
+            print(f"CFG failed: {exc}", file=sys.stderr)
+            return 1
+
+    debug_path = args.debug or _default_debug_for_image(args.image)
+    if not debug_path:
+        print("CFG failed: linked .debug.json metadata is required", file=sys.stderr)
+        return 1
+
+    try:
+        debug_map, _ = load_linked_debug_map(
+            debug_path,
+            link_fingerprint=(
+                manifest_report["link_fingerprint"] if manifest_report is not None else None
+            ),
+        )
+    except SourceMapError as exc:
+        print(f"CFG failed: {exc}", file=sys.stderr)
+        return 1
+
+    start = debug_map["progaddr"]
+    if manifest_report is not None and manifest_report["image_start"] != start:
+        print(
+            f"CFG failed: manifest image_start {manifest_report['image_start']:05X} "
+            f"does not match debug PROGADDR {start:05X}",
+            file=sys.stderr,
+        )
+        return 1
+
+    entry = args.entry
+    if entry is None:
+        entry = (
+            manifest_report["entry"]["address"]
+            if manifest_report is not None
+            else start
+        )
+
+    try:
+        graph = build_control_flow_graph(
+            image,
+            start,
+            debug_map,
+            entry_address=entry,
+            base_register=args.base,
+        )
+    except SourceMapError as exc:
+        print(f"CFG failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(graph, indent=2, sort_keys=True))
+    else:
+        print(render_control_flow_graph(graph), end="")
     return 0
 
 
@@ -362,6 +502,8 @@ def main(argv=None):
         return _run_inspect(args)
     if args.command == "disasm":
         return _run_disasm(args)
+    if args.command == "cfg":
+        return _run_cfg(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2
