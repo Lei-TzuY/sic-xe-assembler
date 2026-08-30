@@ -6,3 +6,4 @@ __pycache__/
 *.manifest.json
 *.sourcemap.json
 *.debug.json
+*.expanded.provenance.json
