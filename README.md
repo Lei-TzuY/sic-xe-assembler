@@ -1,6 +1,6 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, `ORG`, and a linking loader.
+A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, forward `EQU`, `ORG`, and a linking loader.
 
 ## Run the assembler
 
@@ -58,14 +58,22 @@ COPY     START   0
 
 The two `=C'EOF'` references share one pool entry. Literal addresses participate in normal PC/base-relative addressing, and format-4 literal references generate the same control-section relocation records as local symbols.
 
-## Expressions and ORG
+## Expressions, forward EQU, and ORG
 
 Assembler expressions support additive terms made from local symbols, `*`, decimal/hexadecimal integers, and `+` / `-`. Relocation legality follows SIC/XE relative-term algebra: `relative-relative` is absolute, `relative+absolute` remains relocatable, while expressions such as `relative+relative` or `absolute-relative` are rejected.
 
+`EQU` definitions may refer to local symbols or other `EQU` symbols that appear later in the same control section. Definitions that can be evaluated immediately remain available to following statements; unresolved forward definitions are completed after program-block layout, so their final values use rebased block addresses. Dependency chains are resolved transitively and circular definitions are rejected with the dependency path.
+
 ```asm
+LENGTH   EQU     BUFEND-BUFFER
+PTR      EQU     BUFFER+3
 BUFFER   RESB    64
 BUFEND   EQU     *
-LENGTH   EQU     BUFEND-BUFFER
+```
+
+The example resolves `LENGTH` as an absolute value and `PTR` as relocatable even though both reference later symbols. Undefined symbols are reported at the original `EQU` line. Forward `EQU` does not make layout-changing directives speculative: an `ORG` expression must still be resolvable when the `ORG` statement is encountered.
+
+```asm
          ORG     BUFFER+16
 FIELD    RESW    1
          ORG
@@ -104,4 +112,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
