@@ -3,6 +3,9 @@ from expressions import evaluate_expression
 from opcodes import DIRECTIVES, OPCODES
 
 
+PROGRAM_BLOCK_STRIDE = 1 << 28
+
+
 def _strip_comment(line):
     """Strip SIC/XE comments without treating periods inside literals as comments."""
     in_quote = False
@@ -124,7 +127,21 @@ def _parse_nonnegative_decimal(operand, directive):
     return value
 
 
+def _new_block(name, order, virtual_base):
+    return {
+        'name': name,
+        'order': order,
+        'virtual_base': virtual_base,
+        'locctr': 0,
+        'max_locctr': 0,
+        'org_stack': [],
+        'start': None,
+        'length': 0,
+    }
+
+
 def _new_csect(start):
+    default_block = _new_block('', 0, start)
     return {
         'symtab': {},
         'relocatable': set(),
@@ -132,39 +149,110 @@ def _new_csect(start):
         'extref': [],
         'literals': {},
         'pending_literals': [],
-        'org_stack': [],
+        'symbol_blocks': {},
+        'equ_defs': {},
+        'equ_order': [],
+        'blocks': {'': default_block},
         'start': start,
-        'max_locctr': start,
         'length': 0,
+        'finalized': False,
     }
 
 
-def _note_location(csect, locctr):
-    if locctr > csect['max_locctr']:
-        csect['max_locctr'] = locctr
+def _block_location(block):
+    return block['virtual_base'] + block['locctr']
 
 
-def _finish_csect(csect, locctr):
-    _note_location(csect, locctr)
-    length = csect['max_locctr'] - csect['start']
-    if length < 0:
-        raise ValueError("Location counter moved before control-section start")
-    csect['length'] = length
+def _note_block_location(block):
+    if block['locctr'] > block['max_locctr']:
+        block['max_locctr'] = block['locctr']
+
+
+def _ensure_block(csect, block_name):
+    if block_name not in csect['blocks']:
+        order = len(csect['blocks'])
+        virtual_base = csect['start'] + PROGRAM_BLOCK_STRIDE * order
+        csect['blocks'][block_name] = _new_block(block_name, order, virtual_base)
+    return csect['blocks'][block_name]
+
+
+def _finalize_csect(csect):
+    if csect['finalized']:
+        return
+
+    next_start = csect['start']
+    for block in csect['blocks'].values():
+        _note_block_location(block)
+        block['length'] = block['max_locctr']
+        block['start'] = next_start
+        next_start += block['length']
+
+    csect['length'] = next_start - csect['start']
+    if next_start > 0x1000000:
+        raise ValueError("Control section exceeds 24-bit address space")
+
+    for symbol, (block_name, offset) in csect['symbol_blocks'].items():
+        block = csect['blocks'][block_name]
+        csect['symtab'][symbol] = block['start'] + offset
+
+    ordinary_relocatable = set(csect['symbol_blocks'])
+    csect['relocatable'] = ordinary_relocatable
+
+    for symbol in csect['equ_order']:
+        definition = csect['equ_defs'][symbol]
+        block = csect['blocks'][definition['block']]
+        current_location = block['start'] + definition['offset']
+        result = evaluate_expression(
+            definition['expression'],
+            current_location,
+            csect['symtab'],
+            csect['relocatable'],
+        )
+        if not 0 <= result.value <= 0xFFFFFF:
+            raise ValueError(f"EQU value out of range: {result.value}")
+        csect['symtab'][symbol] = result.value
+        if result.relocatable:
+            csect['relocatable'].add(symbol)
+        else:
+            csect['relocatable'].discard(symbol)
+
+    for entry in csect['literals'].values():
+        if entry['block'] is not None:
+            block = csect['blocks'][entry['block']]
+            entry['address'] = block['start'] + entry['offset']
+
+    csect['finalized'] = True
 
 
 def run_pass1(asm_file, int_file, sym_file):
     csects = {}
     current_csect = ""
-    locctr = 0
+    current_block = ''
     start_address = 0
     saw_end = False
+    intermediate_records = []
 
     def fail(line_number, message):
         raise AssemblyError(message, phase="pass 1", line_number=line_number)
 
-    with open(asm_file, 'r') as f_in, open(int_file, 'w') as f_out:
+    def emit_record(csect_name, block_name, offset, text, addressed=True):
+        intermediate_records.append({
+            'csect': csect_name,
+            'block': block_name,
+            'offset': offset,
+            'text': text,
+            'addressed': addressed,
+        })
+
+    with open(asm_file, 'r') as f_in:
         lines = f_in.readlines()
         first_line = True
+
+        def current_data():
+            return csects[current_csect]
+
+        def current_block_data():
+            return current_data()['blocks'][current_block]
 
         def register_literal(csect, operand, line_number):
             try:
@@ -179,23 +267,31 @@ def run_pass1(asm_file, int_file, sym_file):
                 csect['literals'][canonical] = {
                     'address': None,
                     'object_code': object_code,
+                    'block': None,
+                    'offset': None,
                 }
                 csect['pending_literals'].append(canonical)
 
         def flush_literals(csect, line_number):
-            nonlocal locctr
+            block = current_block_data()
             pending = csect['pending_literals']
             for canonical in pending:
                 entry = csect['literals'][canonical]
-                if entry['address'] is not None:
+                if entry['block'] is not None:
                     continue
-                entry['address'] = locctr
+                entry['block'] = current_block
+                entry['offset'] = block['locctr']
                 body = canonical[1:]
-                f_out.write(f"{locctr:04X}\t{canonical} BYTE {body}\n")
-                locctr += len(entry['object_code']) // 2
-                _note_location(csect, locctr)
-                if locctr > 0x1000000:
-                    fail(line_number, "Location counter exceeds 24-bit address space")
+                emit_record(
+                    current_csect,
+                    current_block,
+                    block['locctr'],
+                    f"{canonical} BYTE {body}",
+                )
+                block['locctr'] += len(entry['object_code']) // 2
+                _note_block_location(block)
+                if block['locctr'] > 0x1000000:
+                    fail(line_number, "Program block exceeds 24-bit address space")
             pending.clear()
 
         def define_label(csect, label, line_number):
@@ -203,8 +299,10 @@ def run_pass1(asm_file, int_file, sym_file):
                 return
             if label in csect['symtab']:
                 fail(line_number, f"Duplicate label {label} in {current_csect}")
-            csect['symtab'][label] = locctr
+            block = current_block_data()
+            csect['symtab'][label] = _block_location(block)
             csect['relocatable'].add(label)
+            csect['symbol_blocks'][label] = (current_block, block['locctr'])
 
         for line_number, line in enumerate(lines, 1):
             label, opcode, operand, is_comment = parse_line(line)
@@ -218,10 +316,10 @@ def run_pass1(asm_file, int_file, sym_file):
                     fail(line_number, f"Invalid START address: {operand}")
                 if not 0 <= start_address <= 0xFFFFFF:
                     fail(line_number, f"START address out of range: {operand}")
-                locctr = start_address
                 current_csect = label if label else "DEFAULT"
                 csects[current_csect] = _new_csect(start_address)
-                f_out.write(f"{locctr:04X}\t{line.strip()}\n")
+                current_block = ''
+                emit_record(current_csect, current_block, 0, line.strip())
                 first_line = False
                 continue
 
@@ -230,39 +328,43 @@ def run_pass1(asm_file, int_file, sym_file):
             if not current_csect:
                 current_csect = "DEFAULT"
                 csects[current_csect] = _new_csect(0)
+                current_block = ''
 
             if opcode == 'START':
                 fail(line_number, "START must be the first non-comment statement")
 
             if opcode == 'CSECT':
-                current_data = csects[current_csect]
-                flush_literals(current_data, line_number)
+                csect = current_data()
+                flush_literals(csect, line_number)
                 try:
-                    _finish_csect(current_data, locctr)
+                    _finalize_csect(csect)
                 except ValueError as exc:
                     fail(line_number, str(exc))
+
                 new_csect = label if label else "UNNAMED"
                 if new_csect in csects:
                     fail(line_number, f"Duplicate control section: {new_csect}")
                 current_csect = new_csect
                 csects[current_csect] = _new_csect(0)
-                locctr = 0
-                f_out.write(f"{locctr:04X}\t{line.strip()}\n")
+                current_block = ''
+                emit_record(current_csect, current_block, 0, line.strip())
                 continue
 
             if opcode == 'END':
-                current_data = csects[current_csect]
-                flush_literals(current_data, line_number)
+                csect = current_data()
+                flush_literals(csect, line_number)
                 try:
-                    _finish_csect(current_data, locctr)
+                    _finalize_csect(csect)
                 except ValueError as exc:
                     fail(line_number, str(exc))
-                f_out.write(f"\t\t{line.strip()}\n")
+                emit_record(current_csect, current_block, 0, line.strip(), addressed=False)
                 saw_end = True
                 break
 
-            f_out.write(f"{locctr:04X}\t{line.strip()}\n")
-            csect = csects[current_csect]
+            csect = current_data()
+            block = current_block_data()
+            source_offset = block['locctr']
+            emit_record(current_csect, current_block, source_offset, line.strip())
 
             if opcode == 'EXTDEF':
                 if not operand:
@@ -290,17 +392,21 @@ def run_pass1(asm_file, int_file, sym_file):
                 try:
                     result = evaluate_expression(
                         operand,
-                        locctr,
+                        _block_location(block),
                         csect['symtab'],
                         csect['relocatable'],
                     )
                 except ValueError as exc:
                     fail(line_number, str(exc))
-                if not 0 <= result.value <= 0xFFFFFF:
-                    fail(line_number, f"EQU value out of range: {result.value}")
                 csect['symtab'][label] = result.value
                 if result.relocatable:
                     csect['relocatable'].add(label)
+                csect['equ_defs'][label] = {
+                    'expression': operand,
+                    'block': current_block,
+                    'offset': block['locctr'],
+                }
+                csect['equ_order'].append(label)
                 continue
 
             if opcode == 'ORG':
@@ -309,21 +415,36 @@ def run_pass1(asm_file, int_file, sym_file):
                     try:
                         result = evaluate_expression(
                             operand,
-                            locctr,
+                            _block_location(block),
                             csect['symtab'],
                             csect['relocatable'],
                         )
                     except ValueError as exc:
                         fail(line_number, str(exc))
-                    if not csect['start'] <= result.value <= 0xFFFFFF:
-                        fail(line_number, f"ORG target outside control section address range: {result.value}")
-                    csect['org_stack'].append(locctr)
-                    locctr = result.value
-                    _note_location(csect, locctr)
+                    target_offset = result.value - block['virtual_base']
+                    if not 0 <= target_offset <= 0xFFFFFF:
+                        fail(
+                            line_number,
+                            "ORG target must resolve within the current program block",
+                        )
+                    block['org_stack'].append(block['locctr'])
+                    block['locctr'] = target_offset
+                    _note_block_location(block)
                 else:
-                    if not csect['org_stack']:
+                    if not block['org_stack']:
                         fail(line_number, "ORG restore requested without a saved location")
-                    locctr = csect['org_stack'].pop()
+                    block['locctr'] = block['org_stack'].pop()
+                continue
+
+            if opcode == 'USE':
+                define_label(csect, label, line_number)
+                target_block = operand.strip() if operand else ''
+                if target_block and (
+                    any(char.isspace() for char in target_block) or ',' in target_block
+                ):
+                    fail(line_number, f"Invalid USE block name: {operand}")
+                _ensure_block(csect, target_block)
+                current_block = target_block
                 continue
 
             if opcode == 'LTORG':
@@ -343,24 +464,24 @@ def run_pass1(asm_file, int_file, sym_file):
             if size is not None:
                 if OPCODES[opcode[1:] if opcode.startswith('+') else opcode][1] == 3:
                     register_literal(csect, operand, line_number)
-                locctr += size
+                block['locctr'] += size
             elif opcode == 'WORD':
                 if operand is None:
                     fail(line_number, "WORD requires an operand")
-                locctr += 3
+                block['locctr'] += 3
             elif opcode == 'RESW':
                 try:
-                    locctr += 3 * _parse_nonnegative_decimal(operand, 'RESW')
+                    block['locctr'] += 3 * _parse_nonnegative_decimal(operand, 'RESW')
                 except ValueError as exc:
                     fail(line_number, str(exc))
             elif opcode == 'RESB':
                 try:
-                    locctr += _parse_nonnegative_decimal(operand, 'RESB')
+                    block['locctr'] += _parse_nonnegative_decimal(operand, 'RESB')
                 except ValueError as exc:
                     fail(line_number, str(exc))
             elif opcode == 'BYTE':
                 try:
-                    locctr += len(encode_byte_operand(operand)) // 2
+                    block['locctr'] += len(encode_byte_operand(operand)) // 2
                 except ValueError as exc:
                     fail(line_number, str(exc))
             elif opcode in ['BASE', 'NOBASE']:
@@ -368,12 +489,22 @@ def run_pass1(asm_file, int_file, sym_file):
             elif opcode:
                 fail(line_number, f"Invalid opcode {opcode}")
 
-            _note_location(csect, locctr)
-            if locctr > 0x1000000:
-                fail(line_number, "Location counter exceeds 24-bit address space")
+            _note_block_location(block)
+            if block['locctr'] > 0x1000000:
+                fail(line_number, "Program block exceeds 24-bit address space")
 
     if not saw_end:
         raise AssemblyError("Missing END directive", phase="pass 1")
+
+    with open(int_file, 'w') as f_out:
+        for record in intermediate_records:
+            if not record['addressed']:
+                f_out.write(f"\t\t{record['text']}\n")
+                continue
+            csect = csects[record['csect']]
+            block = csect['blocks'][record['block']]
+            address = block['start'] + record['offset']
+            f_out.write(f"{address:04X}\t{record['text']}\n")
 
     with open(sym_file, 'w') as f_sym:
         for cs_name, cs_data in csects.items():
