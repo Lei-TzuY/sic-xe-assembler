@@ -1,6 +1,8 @@
 import os
 import sys
 
+from object_format import validate_object_records
+
 
 class LoaderError(Exception):
     pass
@@ -12,6 +14,10 @@ def parse_obj_file(filepath):
         for line in f:
             if line.strip():
                 records.append(line.strip('\n'))
+    try:
+        validate_object_records(records)
+    except ValueError as exc:
+        raise LoaderError(f"Invalid object program {filepath}: {exc}") from exc
     return records
 
 
