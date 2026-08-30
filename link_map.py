@@ -41,6 +41,8 @@ def render_link_map(plan):
     lines.append("SIC/XE LINK MAP")
     lines.append("=" * 88)
     lines.append(f"PROGADDR  {plan.progaddr:05X}")
+    lines.append(f"INPUTSET  {plan.input_fingerprint}")
+    lines.append(f"LINKID    {plan.link_fingerprint}")
     lines.append(
         f"IMAGE     {plan.progaddr:05X}-{_image_end(plan):05X} "
         f"(end-exclusive, length={plan.total_length:05X})"
@@ -50,6 +52,16 @@ def render_link_map(plan):
     else:
         lines.append(
             f"ENTRY     {plan.execution_address:05X}  {plan.execution_source}"
+        )
+
+    lines.append("")
+    lines.append("INPUT SNAPSHOTS")
+    lines.append("-" * 88)
+    lines.append("IDX   BYTES      SHA256                                                           FILE")
+    for snapshot in plan.inputs:
+        lines.append(
+            f"{snapshot.input_index:<5} {snapshot.byte_length:<10} "
+            f"{snapshot.sha256}  {snapshot.file_path}"
         )
 
     lines.append("")
@@ -136,8 +148,9 @@ def render_link_map(plan):
 
     lines.append("")
     lines.append(
-        f"SUMMARY sections={len(plan.sections)} symbols={len(plan.estab)} "
-        f"relocations={relocation_count} unused_R={unused_count}"
+        f"SUMMARY inputs={len(plan.inputs)} sections={len(plan.sections)} "
+        f"symbols={len(plan.estab)} relocations={relocation_count} "
+        f"unused_R={unused_count}"
     )
     return "\n".join(lines) + "\n"
 
