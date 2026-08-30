@@ -10,7 +10,7 @@ from assembler_semantics import (
     validate_initialized_storage,
 )
 from errors import AssemblyError
-from macro import run_macro_processor
+from macro import default_macro_provenance_path, run_macro_processor
 from object_format import canonicalize_object_file, validate_source_object_contracts
 from pass1 import parse_line, run_pass1
 from pass2 import run_pass2
@@ -37,6 +37,7 @@ def main(argv=None):
     base_name = os.path.splitext(asm_file)[0]
 
     expanded_file = f"{base_name}.expanded.asm"
+    macro_provenance_file = default_macro_provenance_path(expanded_file)
     int_file = f"{base_name}.int"
     sym_file = f"{base_name}.sym"
     obj_file = f"{base_name}.obj"
@@ -44,6 +45,7 @@ def main(argv=None):
     source_map_file = default_source_map_path(obj_file)
     generated_outputs = [
         expanded_file,
+        macro_provenance_file,
         int_file,
         sym_file,
         obj_file,
@@ -55,8 +57,15 @@ def main(argv=None):
 
     try:
         print("Starting Macro Processor (Pass 0)...")
-        run_macro_processor(asm_file, expanded_file)
-        print(f"Macro Processor completed. Generated: {expanded_file}")
+        run_macro_processor(
+            asm_file,
+            expanded_file,
+            provenance_path=macro_provenance_file,
+        )
+        print(
+            f"Macro Processor completed. Generated: "
+            f"{expanded_file}, {macro_provenance_file}"
+        )
 
         print("Validating object-program contracts...")
         validate_source_object_contracts(expanded_file, parse_line)
@@ -88,6 +97,7 @@ def main(argv=None):
             csects,
             parse_line,
             source_map_file,
+            macro_provenance_path=macro_provenance_file,
         )
         print(
             f"Pass 2 completed. Outputs generated: "
@@ -98,7 +108,7 @@ def main(argv=None):
         _remove_files(generated_outputs)
         print(f"Assembly failed: {exc}", file=sys.stderr)
         return 1
-    except (OSError, SourceMapError) as exc:
+    except (OSError, SourceMapError, ValueError) as exc:
         _remove_files(generated_outputs)
         print(f"Assembly failed: {exc}", file=sys.stderr)
         return 1
