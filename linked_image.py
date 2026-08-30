@@ -33,6 +33,12 @@ def extract_linked_image(plan, memory):
 
 
 def _entry_manifest(plan):
+    if plan.execution_source is None:
+        return {
+            "kind": "default-progaddr",
+            "address": plan.execution_address,
+        }
+
     for section in plan.sections:
         if section.source_execution_address is None:
             continue
@@ -46,15 +52,21 @@ def _entry_manifest(plan):
             "section": section.name,
             "source_address": section.source_execution_address,
         }
-    return {
-        "kind": "default-progaddr",
-        "address": plan.execution_address,
-    }
+
+    raise ValueError(
+        "Explicit execution address has no matching planned-section provenance"
+    )
 
 
 def build_image_manifest(plan, image_bytes):
     """Build path-independent metadata proving the exact linked output bytes."""
     image = bytes(image_bytes)
+    if len(image) != plan.total_length:
+        raise ValueError(
+            "Linked image length does not match validated load plan: "
+            f"expected {plan.total_length}, received {len(image)}"
+        )
+
     return {
         "schema": MANIFEST_SCHEMA,
         "progaddr": plan.progaddr,
