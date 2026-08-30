@@ -1,4 +1,4 @@
-# Source maps and typed linked debug metadata
+# Source maps, macro provenance, and typed linked debug metadata
 
 The assembler and linker intentionally keep executable reproducibility separate from optional debug/source metadata.
 
@@ -10,6 +10,36 @@ The executable identity remains defined by the object input bytes and `PROGADDR`
 
 Debug metadata is layered beside that contract rather than folded into it.
 
+## Macro-expansion provenance
+
+A successful assembly now emits both:
+
+```text
+program.expanded.asm
+program.expanded.provenance.json
+```
+
+The expanded source bytes remain exactly the historical macro-processor output. The provenance sidecar is a separate path-independent layer with schema `sicxe-macro-provenance-v1`.
+
+For every physical expanded-source line it records:
+
+- the expanded line number;
+- the original `.asm` line that supplied the statement text;
+- the outermost source-level macro invocation line, when applicable;
+- whether the line is direct source, a macro marker, an invocation label, or macro body output;
+- the complete nested macro stack.
+
+Each macro-stack frame records the macro name, deterministic invocation instance, definition line, body line, and immediate call-site line. Nested expansion therefore preserves ancestry such as:
+
+```text
+source line 3
+invoked from original line 9
+OUTER#1(def=6, body=7, call=9)
+  -> INNER#2(def=2, body=3, call=7)
+```
+
+The sidecar stores SHA-256 for both the original and expanded source plus a deterministic provenance fingerprint. Moving identical source to another directory does not change the sidecar bytes.
+
 ## Assembler source map
 
 A successful assembly emits:
@@ -18,11 +48,7 @@ A successful assembly emits:
 program.sourcemap.json
 ```
 
-with schema:
-
-```text
-sicxe-source-map-v1
-```
+with schema `sicxe-source-map-v1`.
 
 The source map is path-independent. It stores hashes and semantic content, not host absolute paths.
 
@@ -30,7 +56,9 @@ Top-level fields include:
 
 - canonical object SHA-256;
 - expanded-source SHA-256;
-- deterministic source-map fingerprint;
+- original-source SHA-256 when macro provenance is available;
+- macro-provenance fingerprint;
+- deterministic source-map fingerprint (MAPID);
 - ordered control sections.
 
 Each section records:
@@ -48,13 +76,13 @@ The region types are:
 - `literal`;
 - `reservation`.
 
-Every region stores its final source-object address, section-relative offset, byte length, expanded-source line, source statement text, and any relocatable symbols beginning at that address.
+Every region stores its final source-object address, section-relative offset, byte length, expanded-source line, source statement text, any relocatable symbols beginning at that address, and the original-source/macro ancestry for the expanded statement.
 
 Addresses are collected after Pass 1 finalizes program-block layout. Consequently `USE`, `ORG`, and literal-pool placement are represented by their actual final addresses rather than provisional virtual block addresses.
 
 `RESB`/`RESW` regions are retained even though initialized fields may legally overlap a reservation through `ORG`. The source map describes source intent; it does not reinterpret the existing initialized-storage overlap policy.
 
-Synthetic literal rows are attributed to the `LTORG`, `CSECT`, or `END` source statement that caused the pool to materialize, using the same expanded-source mapping semantics as assembler overlap diagnostics.
+Synthetic literal rows are attributed to the `LTORG`, `CSECT`, or `END` expanded statement that caused the pool to materialize; that statement's own provenance then carries the mapping back to the original source or enclosing macro invocation.
 
 ## Object binding
 
@@ -79,11 +107,7 @@ A successful link emits:
 program.debug.json
 ```
 
-with schema:
-
-```text
-sicxe-linked-debug-v1
-```
+with schema `sicxe-linked-debug-v1`.
 
 The linked debug map contains:
 
@@ -93,7 +117,8 @@ The linked debug map contains:
 - a separate deterministic `DEBUGID`;
 - every planned CSECT placement;
 - source symbols rebased to loaded addresses;
-- typed source regions rebased to loaded addresses.
+- typed source regions rebased to loaded addresses;
+- original-source and nested macro ancestry copied with each typed region.
 
 Relocatable symbols are rebased as:
 
@@ -114,7 +139,7 @@ Keeping a separate `DEBUGID` preserves two useful statements independently:
 - `LINKID`: these are the same executable link inputs and placement;
 - `DEBUGID`: these are the same executable identity plus the same available source/debug metadata.
 
-The independent artifact verifier continues to prove `.bin + .manifest.json + .obj` reproducibility without requiring source maps.
+The independent artifact verifier continues to prove `.bin + .manifest.json + .obj` reproducibility without requiring source maps or macro provenance.
 
 ## Source-aware disassembly
 
@@ -133,7 +158,8 @@ Typed rendering changes the meaning of disassembly:
 - `reservation` regions render as `.RESB` metadata without pretending the zero-filled linked-image bytes were source instructions;
 - exact loaded symbol matches are printed as labels;
 - instruction targets that exactly match known relocatable symbols gain `target_symbol=` annotations;
-- expanded-source line provenance is printed on typed records.
+- expanded-source lines remain visible;
+- each typed line also carries original-source and macro-stack provenance.
 
 Use:
 
@@ -144,6 +170,8 @@ python sicxe.py disasm program.bin --manifest program.manifest.json --linear
 to force the historical raw linear sweep.
 
 For inputs without source maps, typed disassembly falls back to linear decoding for those CSECTs only, so linked images may mix source-aware and untyped third-party object inputs.
+
+Control-flow annotations build on the same typed regions. See [`control-flow.md`](control-flow.md).
 
 ## Inspection
 
@@ -156,10 +184,10 @@ python sicxe.py inspect program.sourcemap.json --json
 python sicxe.py inspect program.debug.json --json
 ```
 
-When the adjacent `.obj` exists, source-map inspection additionally verifies its current object SHA against the sidecar.
+When the adjacent `.obj` exists, source-map inspection additionally verifies its current object SHA against the sidecar. JSON inspection exposes the complete original-source and macro ancestry stored on each region.
 
 ## Limits
 
-The source map currently tracks **expanded-source** line provenance. Macro-generated statements therefore point into `program.expanded.asm`, which is deterministic and exactly what Pass 1/Pass 2 consumed. Mapping macro-expanded statements all the way back through invocation/definition stacks to original pre-expansion source is a separate provenance layer and is not fabricated here.
+Source provenance identifies original file lines and macro definition/invocation stacks, but it does not attempt to reconstruct a source-level AST after macro substitution. A generated line can therefore be traced precisely to its textual origin and call ancestry without claiming that the post-substitution operand text is identical to the macro-definition text.
 
-Likewise, source maps describe assembler-produced objects. Hand-written or third-party object programs remain valid but untyped unless accompanied by a conforming source map.
+Source maps describe assembler-produced objects. Hand-written or third-party object programs remain valid but untyped unless accompanied by a conforming source map.
