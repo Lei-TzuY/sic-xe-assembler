@@ -15,6 +15,7 @@ from object_format import canonicalize_object_file, validate_source_object_contr
 from pass1 import parse_line, run_pass1
 from pass2 import run_pass2
 from pass2_compat import prepare_pass2_inputs
+from source_map import SourceMapError, default_source_map_path, write_source_map
 
 
 def _remove_files(paths):
@@ -39,7 +40,15 @@ def main(argv=None):
     sym_file = f"{base_name}.sym"
     obj_file = f"{base_name}.obj"
     lst_file = f"{base_name}.lst"
-    generated_outputs = [expanded_file, int_file, sym_file, obj_file, lst_file]
+    source_map_file = default_source_map_path(obj_file)
+    generated_outputs = [
+        expanded_file,
+        int_file,
+        sym_file,
+        obj_file,
+        lst_file,
+        source_map_file,
+    ]
 
     # Do not leave stale or partially generated output from a failed assembly.
     _remove_files(generated_outputs)
@@ -72,16 +81,24 @@ def main(argv=None):
                 _remove_files([transient_file])
         canonicalize_object_file(obj_file)
         validate_generated_object_semantics(obj_file)
+        write_source_map(
+            expanded_file,
+            int_file,
+            obj_file,
+            csects,
+            parse_line,
+            source_map_file,
+        )
         print(
             f"Pass 2 completed. Outputs generated: "
-            f"{int_file}, {sym_file}, {obj_file}, {lst_file}"
+            f"{int_file}, {sym_file}, {obj_file}, {lst_file}, {source_map_file}"
         )
         return 0
     except AssemblyError as exc:
         _remove_files(generated_outputs)
         print(f"Assembly failed: {exc}", file=sys.stderr)
         return 1
-    except OSError as exc:
+    except (OSError, SourceMapError) as exc:
         _remove_files(generated_outputs)
         print(f"Assembly failed: {exc}", file=sys.stderr)
         return 1
