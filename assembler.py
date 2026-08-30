@@ -15,7 +15,8 @@ from object_format import canonicalize_object_file, validate_source_object_contr
 from pass1 import parse_line, run_pass1
 from pass2 import run_pass2
 from pass2_compat import prepare_pass2_inputs
-from source_map import SourceMapError, default_source_map_path, write_source_map
+from source_map import SourceMapError, default_source_map_path
+from source_map_contract import write_object_aligned_source_map
 
 
 def _remove_files(paths):
@@ -50,7 +51,6 @@ def main(argv=None):
         source_map_file,
     ]
 
-    # Do not leave stale or partially generated output from a failed assembly.
     _remove_files(generated_outputs)
 
     try:
@@ -81,7 +81,7 @@ def main(argv=None):
                 _remove_files([transient_file])
         canonicalize_object_file(obj_file)
         validate_generated_object_semantics(obj_file)
-        write_source_map(
+        write_object_aligned_source_map(
             expanded_file,
             int_file,
             obj_file,
