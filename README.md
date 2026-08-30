@@ -1,6 +1,6 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, external definitions/references, relocation records, and a linking loader.
+A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, external definitions/references, relocation records, literal pools, and a linking loader.
 
 ## Run the assembler
 
@@ -25,6 +25,21 @@ $LOOP    LDA     &TARGET
 
 Two `SPIN` invocations receive different expanded `$LOOP` symbols. Missing/extra arguments, duplicate or undeclared parameters, unexpected `MEND`, and unterminated definitions are hard assembly errors.
 
+## Literal pools
+
+Format 3/4 instructions may reference character and hexadecimal literals with `=C'..'` and `=X'..'`. Literals are deduplicated within each control section. `LTORG` emits all currently pending literals at the current location; any remaining literals are emitted automatically before `CSECT` or `END`.
+
+```asm
+COPY     START   0
+         LDA     =C'EOF'
+         LDX     =C'EOF'
+         LTORG
+         LDCH    =X'F1'
+         END     COPY
+```
+
+The two `=C'EOF'` references share one pool entry. Literal addresses participate in normal PC/base-relative addressing, and format-4 literal references generate the same control-section relocation records as local symbols.
+
 ## Run the loader
 
 ```powershell
@@ -43,4 +58,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, location-counter expressions, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, location-counter expressions, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
