@@ -1,4 +1,4 @@
-# Inspection and disassembly
+# Inspection, source-aware disassembly, and control flow
 
 The toolchain can inspect every persistent stage without changing it. Inspection is intentionally separate from verification: inspection explains an artifact, while `sicxe.py verify` independently re-links object inputs and proves that the persisted binary and manifest are reproducible.
 
@@ -19,16 +19,25 @@ With `--disassemble`, each T payload is linear-swept as SIC/XE instructions. Any
 
 ## Source-map inspection
 
-Assembler-produced object programs have a path-independent sidecar:
+Assembler-produced object programs have path-independent source/provenance sidecars:
+
+```text
+program.expanded.provenance.json
+program.sourcemap.json
+```
+
+Inspect the source map with:
 
 ```text
 python sicxe.py inspect program.sourcemap.json
 python sicxe.py inspect program.sourcemap.json --json
 ```
 
-The report exposes the canonical object SHA, expanded-source SHA, source-map fingerprint, final CSECT ranges, typed regions, expanded-source lines, and symbols. If the adjacent `.obj` exists, inspection also requires its current SHA to match the map.
+The source-map report exposes canonical object SHA, source-map identity, final CSECT ranges, typed regions, expanded-source lines, and symbols. JSON output additionally exposes original-source SHA, macro-provenance fingerprint, original source line, outermost invocation line, and each nested macro definition/body/call-site frame.
 
-See [`source-maps.md`](source-maps.md) for the binding and DEBUGID contracts.
+If the adjacent `.obj` exists, inspection requires its current SHA to match the map.
+
+See [`source-maps.md`](source-maps.md) for the provenance, binding, and DEBUGID contracts.
 
 ## Linked-image manifest inspection
 
@@ -51,7 +60,7 @@ python sicxe.py inspect program.debug.json
 python sicxe.py inspect program.debug.json --json
 ```
 
-The linked-debug report shows LINKID, DEBUGID, PROGADDR, typed/untyped input status, rebased CSECT ranges, loaded symbol addresses, region kinds, and expanded-source line provenance.
+The linked-debug report shows LINKID, DEBUGID, PROGADDR, typed/untyped input status, rebased CSECT ranges, loaded symbol addresses, region kinds, and expanded-source line provenance. JSON retains the complete original-source/macro ancestry on each typed region.
 
 A debug map is optional metadata. Inputs without source-map sidecars are represented as `typed=false`. A present source map must match its object SHA and section layout or the link fails rather than attaching stale provenance.
 
@@ -74,7 +83,9 @@ Typed CSECTs are rendered according to assembler intent:
 - `reservation` regions render as `.RESB` metadata instead of decoding zero-filled image bytes;
 - exact loaded symbols appear as labels;
 - decoded instruction targets that exactly match known symbols gain `target_symbol=` annotations;
-- every typed region reports its expanded-source line.
+- every typed region reports its expanded-source line;
+- every typed region also reports original-source provenance;
+- macro-generated lines show the outer invocation and complete nested macro stack.
 
 For a linked image containing both assembler-produced and third-party objects, source-aware rendering is mixed: typed CSECTs use source metadata and untyped CSECTs fall back to the raw decoder.
 
@@ -85,6 +96,26 @@ python sicxe.py disasm program.bin --manifest program.manifest.json --linear
 ```
 
 A manifest supplies the correct image start automatically. If both `--manifest` and `--start` are given, their addresses must match. Likewise, a debug map from a different link is rejected through LINKID/PROGADDR checks rather than silently producing wrong annotations.
+
+## CFG-aware disassembly
+
+Add `--cfg` to annotate each typed instruction with its basic block and conservative reachability state, then append the full graph report:
+
+```text
+python sicxe.py disasm program.bin --manifest program.manifest.json --cfg
+```
+
+CFG mode requires both manifest entry provenance and linked debug metadata. It cannot be combined with `--linear` because raw bytes do not provide trusted code boundaries.
+
+Standalone graph output is also available:
+
+```text
+python sicxe.py cfg program.bin --manifest program.manifest.json
+python sicxe.py cfg program.bin --manifest program.manifest.json --json
+python sicxe.py cfg program.bin --manifest program.manifest.json --dot
+```
+
+See [`control-flow.md`](control-flow.md) for branch/call/fallthrough semantics and the conservative meaning of `UNREACHABLE`.
 
 ## Raw decoder
 
@@ -102,24 +133,27 @@ The underlying decoder supports:
 - RSUB special handling;
 - deterministic `.BYTE X'..'` fallback for unknown or truncated opcodes.
 
-## Code/data boundary behavior
+## Code/data and control-flow boundaries
 
-Raw SIC/XE object files and flat linked images do not inherently encode a complete code-vs-data map. A pure raw disassembler must therefore linear-sweep and can mistake ordinary data for valid opcodes.
+Raw SIC/XE object files and flat linked images do not inherently encode a complete code-vs-data type map. A pure raw disassembler must therefore linear-sweep and can mistake ordinary data for valid opcodes.
 
-Assembler source maps remove that ambiguity for assembler-produced regions without pretending to infer unavailable information for third-party objects. `WORD`, `BYTE`, literal pools, and reservations are explicitly typed only when source provenance is available; otherwise the tool remains transparent about falling back to linear decoding.
+Assembler source maps remove that ambiguity for assembler-produced regions without pretending to infer unavailable information for third-party objects. CFG analysis is stricter still: only typed instruction regions become graph nodes.
+
+Dynamic behavior remains dynamic. Indirect/indexed jumps, computed returns, runtime register values, and self-modifying behavior are not fabricated into resolved static edges.
 
 ## Cross-layer invariant
 
-The integration suite now exercises the complete typed path:
+The integration suite exercises the path from original source through graph analysis:
 
-1. assemble source containing code, `WORD`, `BYTE`, reservations, symbols, and literals;
-2. require a source map bound to the exact canonical object SHA;
-3. inspect object and source-map metadata;
-4. link at a nonzero PROGADDR;
-5. require source regions/symbols to rebase into a LINKID-bound debug map;
-6. inspect manifest and debug metadata;
-7. source-aware disassemble the relocated binary;
-8. require data to remain data, reservations to remain reservations, and a branch target to resolve to the rebased symbol;
-9. force `--linear` and confirm the historical raw decoder remains available.
+1. expand nested macros without changing historical expanded-source bytes;
+2. bind every expanded line to original source and macro invocation/definition ancestry;
+3. assemble typed final-address regions and bind them to canonical object SHA;
+4. link at a nonzero PROGADDR and rebase regions/symbols into DEBUGID-bound metadata;
+5. source-aware disassemble the relocated binary while preserving data/reservations;
+6. recover labels and direct branch targets;
+7. start reachability from the manifest execution entry;
+8. build deterministic basic blocks and branch/jump/call/return/fallthrough edges;
+9. identify typed instructions outside the statically provable closure;
+10. retain `--linear` as the explicit raw fallback.
 
-This ties assembler layout, source provenance, object relocation, loader placement, executable identity, debug identity, and disassembly semantics into one regression.
+This ties macro expansion, original-source provenance, assembler layout, relocation, loader placement, executable identity, debug identity, disassembly, and static control flow into one regression surface.
