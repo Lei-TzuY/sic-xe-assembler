@@ -2,6 +2,7 @@ import os
 import sys
 
 from address_space import SICXE_MEMORY_SIZE
+from link_map import default_map_path, write_link_map
 from load_plan import LoadPlanError, build_estab, build_load_plan
 from loader_semantics import analyze_object_records
 
@@ -148,6 +149,13 @@ def dump_memory(memory, start_addr, length):
     print("=" * 65 + "\n")
 
 
+def _remove_stale_map(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python loader.py <obj_file1> [obj_file2 ...] [PROGADDR]")
@@ -170,9 +178,14 @@ def main():
         print("Error: No valid object files provided.", file=sys.stderr)
         return 1
 
+    map_path = default_map_path(obj_files)
+    _remove_stale_map(map_path)
+
     try:
         print(f"Planning {len(obj_files)} object files at PROGADDR {progaddr:05X}...")
         plan = _as_loader_error(build_load_plan, obj_files, progaddr)
+        write_link_map(plan, map_path)
+        print(f"Link map written: {map_path}")
         print_load_map(plan)
         print_estab(plan.estab)
 
@@ -181,6 +194,7 @@ def main():
         dump_memory(memory, progaddr, plan.total_length)
         return 0
     except (LoaderError, OSError, ValueError) as exc:
+        _remove_stale_map(map_path)
         print(f"Load failed: {exc}", file=sys.stderr)
         return 1
 
