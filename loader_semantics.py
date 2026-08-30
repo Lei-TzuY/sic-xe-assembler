@@ -127,14 +127,31 @@ def analyze_object_records(records):
         if record_type == 'M':
             address = _parse_hex(record[1:7], "M-record address")
             offset = address - current['start']
+            half_bytes = _parse_hex(record[7:9], "M-record length")
             if offset < 0 or offset + 3 > current['length']:
                 raise ValueError(
                     f"M record lies outside control section {current['name']}: {record}"
                 )
+
+            for existing in current['modifications']:
+                same_field = (
+                    offset == existing['offset']
+                    and half_bytes == existing['half_bytes']
+                )
+                overlaps = max(offset, existing['offset']) < min(
+                    offset + 3,
+                    existing['offset'] + 3,
+                )
+                if overlaps and not same_field:
+                    raise ValueError(
+                        f"Overlapping modification fields in control section {current['name']}: "
+                        f"{existing['record']} / {record}"
+                    )
+
             current['modifications'].append({
                 'address': address,
                 'offset': offset,
-                'half_bytes': _parse_hex(record[7:9], "M-record length"),
+                'half_bytes': half_bytes,
                 'sign': record[9],
                 'symbol': record[10:16].strip(),
                 'record': record,
