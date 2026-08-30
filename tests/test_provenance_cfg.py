@@ -150,11 +150,11 @@ class ProvenanceCfgTests(unittest.TestCase):
         source.write_text(
             "MAIN START 0\n"
             "     JEQ ALT\n"
-            "     JSUB SUBR\n"
+            "     JSUB ROUTN\n"
             "     J DONE\n"
             "ALT  LDA #1\n"
             "     J DONE\n"
-            "SUBR RSUB\n"
+            "ROUTN RSUB\n"
             "DONE RSUB\n"
             "     END MAIN\n",
             encoding="utf-8",
