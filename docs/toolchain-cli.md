@@ -16,9 +16,12 @@ For normal use, `sicxe.py` exposes the complete workflow through one command sur
 python sicxe.py assemble program.asm
 ```
 
-Assembly keeps the existing fail-closed output policy: stale generated files are removed before work begins and partial outputs are removed if macro expansion, Pass 1, Pass 2, object canonicalization, address-space checks, overlap checks, generated-object semantic validation, or source-map generation fails.
+Assembly keeps the fail-closed output policy: stale generated files are removed before work begins and partial outputs are removed if macro expansion, Pass 1, Pass 2, object canonicalization, address-space checks, overlap checks, generated-object semantic validation, provenance generation, or source-map generation fails.
 
-Alongside `.expanded.asm/.int/.sym/.obj/.lst`, successful assembly emits `program.sourcemap.json`. The sidecar is path-independent, bound to the exact canonical object SHA, and records final typed source regions plus expanded-source line/symbol provenance.
+Alongside `.expanded.asm/.int/.sym/.obj/.lst`, successful assembly emits:
+
+- `program.expanded.provenance.json` — path-independent original-source/macro expansion ancestry for every physical expanded line;
+- `program.sourcemap.json` — object-SHA-bound typed regions, symbols, expanded-source lines, and original-source/macro provenance.
 
 ## Link
 
@@ -33,8 +36,8 @@ One successful link emits four persistent artifacts beside the first object inpu
 
 - `.map` — human-readable section layout, ESTAB, cross-references, relocation arithmetic, provenance, INPUTSET, and LINKID;
 - `.bin` — exact contiguous linked image for `[PROGADDR, PROGADDR + total_length)` after relocation;
-- `.manifest.json` — canonical, path-independent output attestation containing the image SHA-256, ordered object hashes, section layout, entry point, INPUTSET, and LINKID;
-- `.debug.json` — LINKID-bound, path-independent linked source/debug metadata with rebased typed regions, loaded symbols, and a separate DEBUGID.
+- `.manifest.json` — canonical, path-independent output attestation containing image SHA-256, ordered object hashes, section layout, entry point, INPUTSET, and LINKID;
+- `.debug.json` — LINKID-bound, path-independent linked source/debug metadata with rebased typed regions, loaded symbols, original-source/macro ancestry, and separate DEBUGID.
 
 For each object input, the linker auto-detects an adjacent `.sourcemap.json`. Missing source maps are legal and produce an untyped section. Present source maps are trusted only after self-fingerprint, object-SHA, and section-layout validation; a stale sidecar fails the link instead of silently attaching incorrect provenance.
 
@@ -57,9 +60,9 @@ Verification does not trust a previous `.map`, `.debug.json`, or earlier in-memo
 6. re-executes relocation and materializes fresh SIC/XE memory;
 7. compares the reproduced linked range byte-for-byte with the supplied `.bin`;
 8. reconstructs the expected manifest and requires semantic equality;
-9. requires the persisted JSON bytes to equal the canonical deterministic serialization.
+9. requires the persisted JSON bytes to equal canonical deterministic serialization.
 
-This executable reproducibility proof intentionally does not require source/debug maps. DEBUGID is a separate metadata identity from LINKID.
+This executable reproducibility proof intentionally does not require source/debug maps. DEBUGID and macro-provenance identity remain separate metadata identities from LINKID.
 
 ## Inspect
 
@@ -74,7 +77,7 @@ python sicxe.py inspect program.debug.json --json
 
 Object inspection runs the same structural/semantic object analyzer as the loader before displaying CSECT, D/R/T/M/E, raw SHA-256, text bytes, relocation sites, and entry data. `--disassemble` linear-sweeps T-record payloads and attaches overlapping M records.
 
-Source-map inspection displays MAPID, object/source hashes, final source-address typed regions, expanded-source lines, and symbols. If the adjacent `.obj` exists, its current SHA is checked against the sidecar.
+Source-map inspection displays MAPID, object/source hashes, final typed regions, expanded-source lines, and symbols. JSON output additionally exposes original-source lines and nested macro provenance. If the adjacent `.obj` exists, its current SHA is checked against the sidecar.
 
 Linked-debug inspection displays LINKID, DEBUGID, loaded CSECT ranges, typed/untyped status, rebased regions, and loaded symbols.
 
@@ -90,6 +93,7 @@ Inspection explains persisted state; it intentionally does not replace `verify`,
 python sicxe.py disasm program.bin --manifest program.manifest.json
 python sicxe.py disasm program.bin --manifest program.manifest.json --base 8000
 python sicxe.py disasm program.bin --manifest program.manifest.json --offset 32 --length 64
+python sicxe.py disasm program.bin --manifest program.manifest.json --cfg
 python sicxe.py disasm program.bin --manifest program.manifest.json --linear
 ```
 
@@ -104,13 +108,33 @@ Typed regions render according to assembler intent:
 - reservations become `.RESB` metadata;
 - exact loaded symbol starts become labels;
 - instruction targets matching known symbols get `target_symbol=`;
-- expanded-source line provenance is printed.
+- expanded-source line provenance is printed;
+- original-source line and nested macro invocation/definition ancestry are appended.
 
 CSECTs from third-party objects without source-map sidecars fall back to the raw linear decoder. `--linear` forces raw decoding for the entire image even when debug metadata is available.
 
+`--cfg` additionally annotates typed instructions with reachability/basic-block identity and appends the control-flow report. It requires `--manifest` so analysis starts from the true execution entry and cannot be combined with `--linear`.
+
 The underlying decoder handles formats 1–4, original SIC compatibility mode, format-2 operand signatures, `nixbpe`, addressing prefixes, PC-relative targets, optional base-relative targets, indexed addressing, and format-4 20-bit targets. Unknown/truncated bytes fall back to one-byte `.BYTE` records.
 
-See [`inspection-disassembly.md`](inspection-disassembly.md) and [`source-maps.md`](source-maps.md) for the exact typed/untyped contracts.
+## Control flow
+
+```text
+python sicxe.py cfg program.bin --manifest program.manifest.json
+python sicxe.py cfg program.bin --manifest program.manifest.json --json
+python sicxe.py cfg program.bin --manifest program.manifest.json --dot
+python sicxe.py cfg program.bin --manifest program.manifest.json --base 8000
+```
+
+CFG analysis requires LINKID-matching typed debug metadata. The adjacent `.debug.json` is auto-detected unless `--debug` is supplied.
+
+The analyzer uses only regions explicitly typed as instructions. It models direct `J`, conditional `JEQ/JGT/JLT`, `JSUB`, `RSUB`, and ordinary same-CSECT fallthrough; builds deterministic basic blocks; and computes a conservative reachable closure from the manifest execution entry.
+
+Indirect/indexed transfers and unresolved base-relative targets remain unresolved rather than being fabricated into static edges. `UNREACHABLE` therefore means not reachable through the statically provable graph, not that dynamic execution can never reach the address.
+
+`--json` exposes the complete instruction/block/edge model. `--dot` emits deterministic Graphviz DOT.
+
+See [`inspection-disassembly.md`](inspection-disassembly.md), [`source-maps.md`](source-maps.md), and [`control-flow.md`](control-flow.md) for exact contracts and limitations.
 
 ## Expression language
 
