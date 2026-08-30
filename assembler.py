@@ -1,6 +1,10 @@
 import os
 import sys
 
+from assembler_semantics import (
+    validate_generated_object_semantics,
+    validate_initialized_storage,
+)
 from errors import AssemblyError
 from macro import run_macro_processor
 from object_format import canonicalize_object_file, validate_source_object_contracts
@@ -46,6 +50,7 @@ def main(argv=None):
 
         print("Starting Pass 1...")
         csects, start_addr = run_pass1(expanded_file, int_file, sym_file)
+        validate_initialized_storage(expanded_file, int_file, parse_line)
         print(f"Pass 1 completed. Found {len(csects)} CSECT(s).")
 
         print("Starting Pass 2...")
@@ -60,6 +65,7 @@ def main(argv=None):
             if transient_file:
                 _remove_files([transient_file])
         canonicalize_object_file(obj_file)
+        validate_generated_object_semantics(obj_file)
         print(
             f"Pass 2 completed. Outputs generated: "
             f"{int_file}, {sym_file}, {obj_file}, {lst_file}"
