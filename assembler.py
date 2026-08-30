@@ -6,6 +6,7 @@ from macro import run_macro_processor
 from object_format import canonicalize_object_file, validate_source_object_contracts
 from pass1 import parse_line, run_pass1
 from pass2 import run_pass2
+from pass2_compat import prepare_pass2_inputs
 
 
 def _remove_files(paths):
@@ -48,7 +49,16 @@ def main(argv=None):
         print(f"Pass 1 completed. Found {len(csects)} CSECT(s).")
 
         print("Starting Pass 2...")
-        run_pass2(int_file, obj_file, lst_file, csects, start_addr)
+        pass2_int_file, pass2_csects, transient_file = prepare_pass2_inputs(
+            int_file,
+            csects,
+            parse_line,
+        )
+        try:
+            run_pass2(pass2_int_file, obj_file, lst_file, pass2_csects, start_addr)
+        finally:
+            if transient_file:
+                _remove_files([transient_file])
         canonicalize_object_file(obj_file)
         print(
             f"Pass 2 completed. Outputs generated: "
