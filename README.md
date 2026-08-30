@@ -1,6 +1,6 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, external definitions/references, relocation records, literal pools, and a linking loader.
+A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, external definitions/references, relocation records, literal pools, expression algebra, `ORG`, and a linking loader.
 
 ## Run the assembler
 
@@ -40,6 +40,21 @@ COPY     START   0
 
 The two `=C'EOF'` references share one pool entry. Literal addresses participate in normal PC/base-relative addressing, and format-4 literal references generate the same control-section relocation records as local symbols.
 
+## Expressions and ORG
+
+Assembler expressions support additive terms made from local symbols, `*`, decimal/hexadecimal integers, and `+` / `-`. Relocation legality follows SIC/XE relative-term algebra: `relative-relative` is absolute, `relative+absolute` remains relocatable, while expressions such as `relative+relative` or `absolute-relative` are rejected.
+
+```asm
+BUFFER   RESB    64
+BUFEND   EQU     *
+LENGTH   EQU     BUFEND-BUFFER
+         ORG     BUFFER+16
+FIELD    RESW    1
+         ORG
+```
+
+`ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. Control-section length uses the highest location reached, so moving LOCCTR backward cannot truncate the H-record length.
+
 ## Run the loader
 
 ```powershell
@@ -58,4 +73,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, location-counter expressions, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions, `ORG`, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
