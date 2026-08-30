@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -82,7 +83,8 @@ class SourceMapTests(unittest.TestCase):
         self.assertTrue(any(symbol["name"] == "VALUE" for symbol in section["symbols"]))
 
         # The sidecar is bound to the exact canonical object bytes.
-        load_source_map(map_path, object_sha256=obj.read_bytes().hex()[:64])
+        object_sha = hashlib.sha256(obj.read_bytes()).hexdigest()
+        load_source_map(map_path, object_sha256=object_sha)
 
     def test_linker_rebases_regions_and_typed_disassembly_preserves_data(self):
         _, source = self.make_program()
@@ -108,7 +110,7 @@ class SourceMapTests(unittest.TestCase):
         self.assertIn(".RESB 8", text)
         self.assertIn(".LITERAL X'FF'", text)
         self.assertIn("target_symbol=FIRST", text)
-        self.assertNotIn("00005  ", text)  # source addresses were rebased
+        self.assertNotIn("01000  ", text)  # source addresses were rebased
 
     def test_stale_source_map_causes_fail_closed_link_and_cleans_artifacts(self):
         _, source = self.make_program()
