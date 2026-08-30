@@ -173,6 +173,82 @@ def render_object_inspection(report):
     return "\n".join(lines) + "\n"
 
 
+def _require_fields(mapping, fields, description):
+    if not isinstance(mapping, dict):
+        raise InspectionError(f"{description} must be a JSON object")
+    missing = [field for field in fields if field not in mapping]
+    if missing:
+        raise InspectionError(
+            f"{description} is missing required field(s): {', '.join(missing)}"
+        )
+
+
+def _validate_manifest_shape(manifest):
+    _require_fields(
+        manifest,
+        (
+            "schema",
+            "progaddr",
+            "image_start",
+            "image_end_exclusive",
+            "image_length",
+            "image_sha256",
+            "input_fingerprint",
+            "link_fingerprint",
+            "entry",
+            "inputs",
+            "sections",
+        ),
+        "Image manifest",
+    )
+    if manifest["schema"] != MANIFEST_SCHEMA:
+        raise InspectionError(
+            f"Unsupported image manifest schema: {manifest['schema']!r}"
+        )
+    for field in ("progaddr", "image_start", "image_end_exclusive", "image_length"):
+        if not isinstance(manifest[field], int) or isinstance(manifest[field], bool):
+            raise InspectionError(f"Image manifest field {field} must be an integer")
+    if manifest["image_length"] < 0:
+        raise InspectionError("Image manifest image_length must be non-negative")
+    if manifest["image_end_exclusive"] != manifest["image_start"] + manifest["image_length"]:
+        raise InspectionError(
+            "Image manifest range is inconsistent with image_length"
+        )
+    if manifest["progaddr"] != manifest["image_start"]:
+        raise InspectionError("Image manifest PROGADDR does not match image_start")
+    if not isinstance(manifest["inputs"], list):
+        raise InspectionError("Image manifest inputs must be a JSON array")
+    if not isinstance(manifest["sections"], list):
+        raise InspectionError("Image manifest sections must be a JSON array")
+
+    _require_fields(manifest["entry"], ("kind", "address"), "Image manifest entry")
+    for index, item in enumerate(manifest["inputs"]):
+        _require_fields(
+            item,
+            ("input_index", "byte_length", "sha256"),
+            f"Image manifest input {index}",
+        )
+    for index, section in enumerate(manifest["sections"]):
+        _require_fields(
+            section,
+            (
+                "input_index",
+                "section_index",
+                "name",
+                "source_start",
+                "load_address",
+                "length",
+            ),
+            f"Image manifest section {index}",
+        )
+    if manifest["entry"].get("kind") == "explicit":
+        _require_fields(
+            manifest["entry"],
+            ("input_index", "section_index", "section", "source_address"),
+            "Explicit image manifest entry",
+        )
+
+
 def _read_manifest(path):
     source = Path(path)
     try:
@@ -183,12 +259,7 @@ def _read_manifest(path):
         manifest = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InspectionError(f"Invalid JSON manifest {path}: {exc}") from exc
-    if not isinstance(manifest, dict):
-        raise InspectionError("Image manifest root must be a JSON object")
-    if manifest.get("schema") != MANIFEST_SCHEMA:
-        raise InspectionError(
-            f"Unsupported image manifest schema: {manifest.get('schema')!r}"
-        )
+    _validate_manifest_shape(manifest)
     return raw, manifest
 
 
