@@ -148,9 +148,9 @@ def render_link_map(plan):
 
     lines.append("")
     lines.append(
-        f"SUMMARY inputs={len(plan.inputs)} sections={len(plan.sections)} "
-        f"symbols={len(plan.estab)} relocations={relocation_count} "
-        f"unused_R={unused_count}"
+        f"SUMMARY sections={len(plan.sections)} symbols={len(plan.estab)} "
+        f"relocations={relocation_count} unused_R={unused_count} "
+        f"inputs={len(plan.inputs)}"
     )
     return "\n".join(lines) + "\n"
 
