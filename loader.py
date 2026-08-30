@@ -16,6 +16,11 @@ from load_plan import (
     capture_link_session,
 )
 from loader_semantics import analyze_object_records
+from source_map import (
+    SourceMapError,
+    default_debug_map_path,
+    write_linked_debug_map,
+)
 
 
 class LoaderError(Exception):
@@ -239,7 +244,8 @@ def main(argv=None):
     map_path = default_map_path(obj_files)
     image_path = default_image_path(obj_files)
     manifest_path = default_manifest_path(obj_files)
-    artifact_paths = (map_path, image_path, manifest_path)
+    debug_path = default_debug_map_path(obj_files)
+    artifact_paths = (map_path, image_path, manifest_path, debug_path)
     _remove_stale_artifacts(artifact_paths)
 
     try:
@@ -256,16 +262,18 @@ def main(argv=None):
             manifest_path,
         )
         write_link_map(plan, map_path)
+        write_linked_debug_map(plan, debug_path)
 
         print(f"Linked image written: {written_image}")
         print(f"Image manifest written: {written_manifest}")
         print(f"Link map written: {map_path}")
+        print(f"Linked debug map written: {debug_path}")
         print_load_map(plan)
         print_estab(plan.estab)
         print(f"Load complete. Execution start address: {exec_addr:05X}\n")
         dump_memory(memory, progaddr, plan.total_length)
         return 0
-    except (LoaderError, OSError, ValueError) as exc:
+    except (LoaderError, OSError, ValueError, SourceMapError) as exc:
         _remove_stale_artifacts(artifact_paths)
         print(f"Load failed: {exc}", file=sys.stderr)
         return 1
