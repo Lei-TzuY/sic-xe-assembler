@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from inspector import (
+    InspectionError,
     inspect_image_manifest,
     inspect_object_file,
     render_manifest_inspection,
@@ -104,6 +105,37 @@ class InspectorTests(unittest.TestCase):
         changed = inspect_image_manifest(manifest, image_path=image)
         self.assertFalse(changed["image"]["length_matches"])
         self.assertFalse(changed["image"]["sha256_matches"])
+
+    def test_manifest_inspector_fails_cleanly_on_missing_or_inconsistent_fields(self):
+        directory = self.make_temp_dir()
+        manifest = directory / "bad.manifest.json"
+        manifest.write_text(
+            json.dumps({"schema": MANIFEST_SCHEMA, "progaddr": 0x4000}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(InspectionError, "missing required field"):
+            inspect_image_manifest(manifest)
+
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema": MANIFEST_SCHEMA,
+                    "progaddr": 0x4000,
+                    "image_start": 0x4000,
+                    "image_end_exclusive": 0x4005,
+                    "image_length": 4,
+                    "image_sha256": "a" * 64,
+                    "input_fingerprint": "b" * 64,
+                    "link_fingerprint": "c" * 64,
+                    "entry": {"kind": "default-progaddr", "address": 0x4000},
+                    "inputs": [],
+                    "sections": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(InspectionError, "range is inconsistent"):
+            inspect_image_manifest(manifest)
 
 
 if __name__ == "__main__":
