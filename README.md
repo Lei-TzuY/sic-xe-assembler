@@ -1,8 +1,8 @@
 # SIC/XE Assembler and Linking Loader
 
-A dependency-free Python implementation of a SIC/XE macro assembler and linking loader, with unusually strict semantic validation, deterministic linking, reproducible output artifacts, independent artifact verification, structured inspection, source maps, and instruction disassembly.
+A dependency-free Python implementation of a SIC/XE macro assembler and linking loader, with unusually strict semantic validation, deterministic linking, reproducible output artifacts, independent artifact verification, structured inspection, source maps, original-source macro provenance, disassembly, and typed control-flow analysis.
 
-The project started as a conventional two-pass assembler and now covers the complete SIC/XE instruction table, macros, literals, program blocks, control sections, relocation expressions, a validated load-plan model, a 1 MiB machine-memory model, persistent link maps, deterministic linked images, end-to-end reproducibility checks, object/manifest inspection, typed source metadata, and formats 1–4 disassembly.
+The project started as a conventional two-pass assembler and now covers the complete SIC/XE instruction table, macros, literals, program blocks, control sections, relocation expressions, a validated load-plan model, a 1 MiB machine-memory model, persistent link maps, deterministic linked images, end-to-end reproducibility checks, typed source/debug metadata, formats 1–4 disassembly, and conservative basic-block/CFG analysis.
 
 ## Quick start
 
@@ -17,6 +17,8 @@ python sicxe.py inspect program.debug.json
 python sicxe.py inspect program.manifest.json
 python sicxe.py verify program.bin program.manifest.json program.obj
 python sicxe.py disasm program.bin --manifest program.manifest.json
+python sicxe.py disasm program.bin --manifest program.manifest.json --cfg
+python sicxe.py cfg program.bin --manifest program.manifest.json --dot
 ```
 
 The historical entry points remain supported:
@@ -35,7 +37,7 @@ No third-party runtime packages are required.
 | --- | --- |
 | Instructions | Complete SIC/XE instruction table; formats 1, 2, 3, and 4 |
 | Addressing | immediate, indirect, indexed, PC-relative, base-relative, extended |
-| Macros | parameters, quoted arguments, nested expansion, recursion detection, unique local labels |
+| Macros | parameters, quoted arguments, nested expansion, recursion detection, unique local labels, original-source invocation/definition provenance |
 | Literals | `=C'..'`, `=X'..'`, deduplication, `LTORG`, automatic pool flush |
 | Expressions | parentheses, unary `+/-`, `*`/`/` precedence, relocation-aware `+/-` |
 | Symbols | `EQU`, forward `EQU` dependencies, cycle detection, `*` current location |
@@ -45,9 +47,10 @@ No third-party runtime packages are required.
 | Machine model | 20-bit SIC/XE address space / 1 MiB memory; independent 24-bit WORD values |
 | Reproducibility | immutable object snapshots, INPUTSET, LINKID, deterministic `.map/.bin/manifest` |
 | Verification | independent re-link and byte-for-byte artifact reproduction |
-| Source maps | object-SHA-bound typed regions, expanded-source lines, symbols, linked rebasing, DEBUGID |
+| Source maps | object-SHA-bound typed regions, expanded/original source lines, nested macro ancestry, symbols, linked rebasing, DEBUGID |
 | Inspection | validated CSECT/D/R/T/M/E reports, source/debug map reports, manifest/image SHA checks, JSON output |
 | Disassembly | formats 1–4, SIC compatibility, format-2 signatures, nixbpe, PC/base targets, typed data-aware rendering |
+| Control flow | manifest-entry reachability, typed basic blocks, branch/jump/call/return edges, JSON and Graphviz DOT |
 
 ## Assembly pipeline
 
@@ -55,6 +58,7 @@ For `program.asm`, assembly produces:
 
 ```text
 program.expanded.asm
+program.expanded.provenance.json
 program.int
 program.sym
 program.obj
@@ -64,7 +68,7 @@ program.sourcemap.json
 
 The successful pipeline is deliberately fail-closed:
 
-1. macro expansion;
+1. macro expansion plus deterministic line-provenance capture;
 2. object-name/source-contract preflight;
 3. source START address validation;
 4. Pass 1 symbol/layout construction;
@@ -73,11 +77,11 @@ The successful pipeline is deliberately fail-closed:
 7. Pass 2 object generation;
 8. object-record canonicalization;
 9. generated-object semantic validation using the same analyzer as the loader;
-10. deterministic source-map generation bound to the exact canonical object SHA-256.
+10. deterministic source-map generation bound to the exact canonical object SHA-256 and macro-provenance fingerprint.
 
-If any stage fails, stale and partial generated outputs, including a previous source map, are removed.
+If any stage fails, stale and partial generated outputs, including provenance/source-map sidecars, are removed.
 
-### Macro processor
+### Macro processor and original-source provenance
 
 Macros use positional `&NAME` parameters. Arguments may contain quoted commas, macro bodies may invoke other macros, recursive expansion is rejected, and `$LOCAL` labels are rewritten into deterministic unique labels for each invocation.
 
@@ -87,6 +91,10 @@ $LOOP    LDA     &TARGET
          J       $LOOP
          MEND
 ```
+
+The historical `program.expanded.asm` bytes remain unchanged. A separate `program.expanded.provenance.json` records every physical expanded line, its original source line, the outermost invocation line, and the full nested macro stack. Each frame includes macro name, deterministic invocation instance, definition line, body line, and immediate call-site line. The sidecar is path-independent and self-fingerprinted.
+
+That provenance is then copied onto typed regions in `program.sourcemap.json` and survives rebasing into `program.debug.json`, so linked instructions can be traced back through macro expansion history without modifying executable identity.
 
 ### Literals and program blocks
 
@@ -166,7 +174,7 @@ program.debug.json
 
 `program.manifest.json` uses schema `sicxe-linked-image-v1` and attests the binary SHA-256, ordered input hashes, section layout, entry point, INPUTSET, and LINKID. It intentionally contains no host paths, so moving identical object bytes to another directory does not change the manifest.
 
-`program.debug.json` is a separate optional-metadata identity layer. For assembler-produced inputs, the linker verifies adjacent `.sourcemap.json` files against immutable object SHA-256 snapshots, validates section layout, rebases relocatable symbols/typed regions to loaded addresses, and records a separate DEBUGID. Inputs without a source-map sidecar remain linkable and are marked `typed=false`; a present-but-invalid sidecar fails closed.
+`program.debug.json` is a separate optional-metadata identity layer. For assembler-produced inputs, the linker verifies adjacent `.sourcemap.json` files against immutable object SHA-256 snapshots, validates section layout, rebases relocatable symbols/typed regions to loaded addresses, preserves original-source/macro ancestry, and records a separate DEBUGID. Inputs without a source-map sidecar remain linkable and are marked `typed=false`; a present-but-invalid sidecar fails closed.
 
 Keeping DEBUGID separate from LINKID means source metadata never changes executable identity or the independent `.bin/.manifest/.obj` reproducibility proof.
 
@@ -198,7 +206,7 @@ python sicxe.py inspect program.manifest.json
 
 Object inspection first runs the shared object semantic analyzer, then reports raw SHA-256, CSECT ranges, D/R/T/M/E records, exact text bytes, relocation fields, entry data, and summary counts. `--disassemble` additionally linear-sweeps each T payload and attaches any intersecting M records to the decoded record.
 
-Source-map inspection reports object/source hashes, MAPID, final source addresses, region types, expanded-source lines, and symbols. When the adjacent `.obj` is present, its current SHA is checked against the sidecar.
+Source-map JSON contains object/source hashes, MAPID, final source addresses, region types, expanded-source lines, original-source lines, nested macro ancestry, and symbols. When the adjacent `.obj` is present, its current SHA is checked against the sidecar.
 
 Linked-debug inspection reports LINKID, DEBUGID, loaded section placement, typed/untyped status, rebased regions, and symbol starts.
 
@@ -221,7 +229,8 @@ Typed rendering uses assembler intent rather than treating every byte as probabl
 - reservations render as `.RESB` metadata rather than decoding deterministic zero-filled image bytes as instructions;
 - loaded labels are printed at exact symbol starts;
 - instruction targets that equal known symbols gain `target_symbol=` annotations;
-- expanded-source line provenance is shown on typed records.
+- expanded-source line provenance remains visible;
+- original-source line and nested macro invocation/definition ancestry are appended to each typed record.
 
 A linked image can mix typed assembler inputs and untyped third-party object inputs; untyped CSECTs fall back to the normal linear decoder.
 
@@ -233,7 +242,22 @@ python sicxe.py disasm program.bin --manifest program.manifest.json --linear
 
 The underlying decoder still handles formats 1–4, original SIC compatibility mode, register/shift/SVC format-2 signatures, `nixbpe`, immediate/indirect/indexed syntax, PC-relative targets, optional base-relative target resolution, and 20-bit format-4 targets. Unknown/truncated bytes fall back to one-byte `.BYTE` records so a raw sweep remains deterministic.
 
-Source provenance currently points to deterministic `program.expanded.asm` lines. Macro invocation/definition stack mapping back to the original pre-expansion source is not fabricated and remains a separate future provenance layer.
+### Control-flow analysis
+
+Typed instructions can also be organized into a conservative static CFG:
+
+```powershell
+python sicxe.py cfg program.bin --manifest program.manifest.json
+python sicxe.py cfg program.bin --manifest program.manifest.json --json
+python sicxe.py cfg program.bin --manifest program.manifest.json --dot
+python sicxe.py disasm program.bin --manifest program.manifest.json --cfg
+```
+
+The analyzer starts from the **actual execution entry in the manifest**, not merely PROGADDR. It models direct `J`, conditional `JEQ/JGT/JLT`, `JSUB`, `RSUB`, and ordinary fallthrough; builds deterministic basic blocks; and marks typed instructions outside the statically provable entry closure as `UNREACHABLE`.
+
+Indirect (`@`) and indexed (`,X`) transfers are not pretended to be resolved static targets. Untyped bytes and data regions never become CFG nodes. Therefore `UNREACHABLE` means "not reachable through the statically provable edges represented by this analysis", not "the CPU can never execute this address".
+
+See [`docs/control-flow.md`](docs/control-flow.md) for the exact edge and reachability contract.
 
 See [`docs/toolchain-cli.md`](docs/toolchain-cli.md), [`docs/inspection-disassembly.md`](docs/inspection-disassembly.md), and [`docs/source-maps.md`](docs/source-maps.md).
 
@@ -247,9 +271,9 @@ python -m unittest discover -s tests -v
 python verify.py
 ```
 
-`verify.py` assembles the four checked-in fixture programs in an isolated temporary directory and byte-compares `.expanded.asm`, `.int`, `.sym`, `.obj`, and `.lst` against the tracked golden outputs. Source/debug metadata has independent deterministic regression coverage so the historical golden artifact contract remains unchanged.
+`verify.py` assembles the four checked-in fixture programs in an isolated temporary directory and byte-compares `.expanded.asm`, `.int`, `.sym`, `.obj`, and `.lst` against the tracked golden outputs. Provenance/source/debug/CFG metadata has independent deterministic regression coverage so the historical golden artifact contract remains unchanged.
 
-GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 3.13. Byte-for-byte golden fixture verification runs on Linux, while the cross-platform matrix exercises filesystem behavior, atomic artifact writes, the unified CLI, linking, reproducibility verification, source/debug maps, inspection, and source-aware disassembly.
+GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 3.13. Byte-for-byte golden fixture verification runs on Linux, while the cross-platform matrix exercises filesystem behavior, atomic artifact writes, the unified CLI, linking, reproducibility verification, source/debug maps, original-source provenance, source-aware disassembly, and CFG analysis.
 
 ## Documentation
 
@@ -258,10 +282,11 @@ GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 
 - [`docs/load-plan.md`](docs/load-plan.md) — deterministic planning and immutable link sessions
 - [`docs/link-map.md`](docs/link-map.md) — stable linker map / cross-reference format
 - [`docs/linked-image.md`](docs/linked-image.md) — binary image and manifest contract
-- [`docs/source-maps.md`](docs/source-maps.md) — assembler source maps, linked DEBUGID, typed regions
+- [`docs/source-maps.md`](docs/source-maps.md) — macro provenance, assembler source maps, linked DEBUGID, typed regions
+- [`docs/control-flow.md`](docs/control-flow.md) — conservative typed CFG, basic blocks, reachability, DOT output
 - [`docs/toolchain-cli.md`](docs/toolchain-cli.md) — unified CLI, verifier, and expression grammar
 - [`docs/inspection-disassembly.md`](docs/inspection-disassembly.md) — inspectors, decoder, and raw code/data limitation
 
 ## Scope
 
-This remains an educational SIC/XE implementation rather than a production-system linker, but correctness is treated as a first-class goal: malformed inputs fail hard, relocation is explicit, address-space limits are enforced, executable and debug provenance are separately recorded, final linked artifacts can be independently reproduced and verified, and assembler-produced images can now be disassembled with explicit code/data intent instead of silently pretending every byte is code.
+This remains an educational SIC/XE implementation rather than a production-system linker, but correctness is treated as a first-class goal: malformed inputs fail hard, relocation is explicit, address-space limits are enforced, executable and debug provenance are separately recorded, final linked artifacts can be independently reproduced and verified, macro-generated machine code can be traced back to original source/call stacks, and assembler-produced images can be disassembled and structurally analyzed without silently pretending every byte or every dynamic edge is statically known.
