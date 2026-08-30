@@ -7,6 +7,11 @@ from address_space import (
     validate_machine_range,
 )
 from loader_semantics import analyze_object_records
+from relocation import (
+    FORMAT4_RELOCATION_HALF_BYTES,
+    decode_object_addend,
+    encode_relocated_value,
+)
 
 
 class LoaderError(Exception):
@@ -76,6 +81,59 @@ def _check_memory_range(memory, start, length, description):
         raise LoaderError(f"{description} exceeds loader memory")
 
 
+def _group_modifications(modifications):
+    """Preserve first-seen field order while grouping repeated M terms."""
+    groups = {}
+    order = []
+    for modification in modifications:
+        key = (modification['offset'], modification['half_bytes'])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(modification)
+    return [groups[key] for key in order]
+
+
+def _apply_modification_group(memory, csaddr, section, group, estab):
+    first = group[0]
+    mod_addr = csaddr + first['offset']
+    _check_memory_range(memory, mod_addr, 3, "Modification record")
+
+    raw_value = (
+        (memory[mod_addr] << 16)
+        | (memory[mod_addr + 1] << 8)
+        | memory[mod_addr + 2]
+    )
+    try:
+        addend = decode_object_addend(raw_value, first['half_bytes'])
+    except ValueError as exc:
+        raise LoaderError(str(exc)) from exc
+
+    delta = 0
+    for modification in group:
+        sym_name = modification['symbol']
+        if sym_name not in estab:
+            raise LoaderError(f"Undefined external symbol {sym_name}")
+        sym_value = estab[sym_name]
+        delta += sym_value if modification['sign'] == '+' else -sym_value
+
+    relocated = addend + delta
+    try:
+        encoded = encode_relocated_value(relocated, first['half_bytes'])
+    except ValueError as exc:
+        raise LoaderError(
+            f"{exc} in {section['name']} at {first['address']:06X} "
+            f"(addend={addend}, delta={delta})"
+        ) from exc
+
+    if first['half_bytes'] == FORMAT4_RELOCATION_HALF_BYTES:
+        encoded |= raw_value & 0xF00000
+
+    memory[mod_addr] = (encoded >> 16) & 0xFF
+    memory[mod_addr + 1] = (encoded >> 8) & 0xFF
+    memory[mod_addr + 2] = encoded & 0xFF
+
+
 def pass2(obj_files, progaddr, estab):
     _validate_progaddr(progaddr)
     csaddr = progaddr
@@ -95,43 +153,12 @@ def pass2(obj_files, progaddr, estab):
                 _check_memory_range(memory, start_addr, text['length'], "Text record")
                 memory[start_addr:start_addr + text['length']] = text['data']
 
-            # Apply modifications only after all text bytes for the section have
-            # been materialized. The semantic analyzer guarantees that every
-            # three-byte modification field is fully backed by T records.
-            for modification in section['modifications']:
-                sym_name = modification['symbol']
-                if sym_name not in estab:
-                    raise LoaderError(f"Undefined external symbol {sym_name}")
-
-                mod_addr = csaddr + modification['offset']
-                _check_memory_range(memory, mod_addr, 3, "Modification record")
-                val = (
-                    (memory[mod_addr] << 16)
-                    | (memory[mod_addr + 1] << 8)
-                    | memory[mod_addr + 2]
-                )
-
-                mod_len = modification['half_bytes']
-                if mod_len == 5:
-                    target = val & 0x0FFFFF
-                    keep_mask = 0xF00000
-                    width_mask = 0x0FFFFF
-                else:
-                    target = val & 0xFFFFFF
-                    keep_mask = 0
-                    width_mask = 0xFFFFFF
-
-                sym_val = estab[sym_name]
-                if modification['sign'] == '+':
-                    target += sym_val
-                else:
-                    target -= sym_val
-                target &= width_mask
-                val = (val & keep_mask) | target
-
-                memory[mod_addr] = (val >> 16) & 0xFF
-                memory[mod_addr + 1] = (val >> 8) & 0xFF
-                memory[mod_addr + 2] = val & 0xFF
+            # Every repeated M record for the same field is one relocation
+            # expression. Sum the exact signed symbol deltas first, validate the
+            # final 20/24-bit result once, then write the field once. This avoids
+            # record-order-dependent modular wraparound.
+            for group in _group_modifications(section['modifications']):
+                _apply_modification_group(memory, csaddr, section, group, estab)
 
             source_exec = section['execution_address']
             if source_exec is not None:
