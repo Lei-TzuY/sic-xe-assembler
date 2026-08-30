@@ -1,3 +1,4 @@
+from address_space import validate_machine_range
 from object_format import validate_object_records
 
 
@@ -54,12 +55,13 @@ def analyze_object_records(records):
         if record_type == 'H':
             start = _parse_hex(record[7:13], "H-record start")
             length = _parse_hex(record[13:19], "H-record length")
-            if start + length > 0x1000000:
-                raise ValueError(
-                    f"Control section exceeds 24-bit address space: {record}"
-                )
+            name = record[1:7].strip()
+            try:
+                validate_machine_range(start, length, f"Control section {name}")
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
             current = {
-                'name': record[1:7].strip(),
+                'name': name,
                 'start': start,
                 'length': length,
                 'definitions': [],
