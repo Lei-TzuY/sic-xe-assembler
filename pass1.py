@@ -132,13 +132,21 @@ def _new_csect(start):
         'extref': [],
         'literals': {},
         'pending_literals': [],
+        'org_stack': [],
         'start': start,
+        'max_locctr': start,
         'length': 0,
     }
 
 
+def _note_location(csect, locctr):
+    if locctr > csect['max_locctr']:
+        csect['max_locctr'] = locctr
+
+
 def _finish_csect(csect, locctr):
-    length = locctr - csect['start']
+    _note_location(csect, locctr)
+    length = csect['max_locctr'] - csect['start']
     if length < 0:
         raise ValueError("Location counter moved before control-section start")
     csect['length'] = length
@@ -185,9 +193,18 @@ def run_pass1(asm_file, int_file, sym_file):
                 body = canonical[1:]
                 f_out.write(f"{locctr:04X}\t{canonical} BYTE {body}\n")
                 locctr += len(entry['object_code']) // 2
+                _note_location(csect, locctr)
                 if locctr > 0x1000000:
                     fail(line_number, "Location counter exceeds 24-bit address space")
             pending.clear()
+
+        def define_label(csect, label, line_number):
+            if not label:
+                return
+            if label in csect['symtab']:
+                fail(line_number, f"Duplicate label {label} in {current_csect}")
+            csect['symtab'][label] = locctr
+            csect['relocatable'].add(label)
 
         for line_number, line in enumerate(lines, 1):
             label, opcode, operand, is_comment = parse_line(line)
@@ -286,22 +303,37 @@ def run_pass1(asm_file, int_file, sym_file):
                     csect['relocatable'].add(label)
                 continue
 
+            if opcode == 'ORG':
+                define_label(csect, label, line_number)
+                if operand:
+                    try:
+                        result = evaluate_expression(
+                            operand,
+                            locctr,
+                            csect['symtab'],
+                            csect['relocatable'],
+                        )
+                    except ValueError as exc:
+                        fail(line_number, str(exc))
+                    if not csect['start'] <= result.value <= 0xFFFFFF:
+                        fail(line_number, f"ORG target outside control section address range: {result.value}")
+                    csect['org_stack'].append(locctr)
+                    locctr = result.value
+                    _note_location(csect, locctr)
+                else:
+                    if not csect['org_stack']:
+                        fail(line_number, "ORG restore requested without a saved location")
+                    locctr = csect['org_stack'].pop()
+                continue
+
             if opcode == 'LTORG':
                 if operand:
                     fail(line_number, "LTORG does not take an operand")
-                if label:
-                    if label in csect['symtab']:
-                        fail(line_number, f"Duplicate label {label} in {current_csect}")
-                    csect['symtab'][label] = locctr
-                    csect['relocatable'].add(label)
+                define_label(csect, label, line_number)
                 flush_literals(csect, line_number)
                 continue
 
-            if label:
-                if label in csect['symtab']:
-                    fail(line_number, f"Duplicate label {label} in {current_csect}")
-                csect['symtab'][label] = locctr
-                csect['relocatable'].add(label)
+            define_label(csect, label, line_number)
 
             try:
                 size = instruction_size(opcode) if opcode else None
@@ -336,6 +368,7 @@ def run_pass1(asm_file, int_file, sym_file):
             elif opcode:
                 fail(line_number, f"Invalid opcode {opcode}")
 
+            _note_location(csect, locctr)
             if locctr > 0x1000000:
                 fail(line_number, "Location counter exceeds 24-bit address space")
 
