@@ -55,6 +55,19 @@ FIELD    RESW    1
 
 `ORG expression` saves the current location and moves LOCCTR to the evaluated address; operand-less `ORG` restores the most recently saved location. Control-section length uses the highest location reached, so moving LOCCTR backward cannot truncate the H-record length.
 
+## External relocation expressions
+
+`WORD` and format-4 instructions may combine `EXTREF` symbols with constants and local relocatable terms. The assembler stores the section-relative/absolute part in the object field and emits one signed modification record for every deferred relocation term.
+
+```asm
+         EXTREF  EXT1,EXT2
+FIRST    +LDA    EXT1+7
+DIFF     WORD    EXT1-EXT2+5
+MIX      WORD    FIRST+EXT1-EXT2
+```
+
+For `DIFF`, the initial WORD value is `5`, followed by `+EXT1` and `-EXT2` modification records. `MIX` additionally emits a `+<current CSECT>` modification for the local relocatable `FIRST` term. Format-3 instructions reject expressions containing external symbols because they cannot be resolved with 12-bit PC/base-relative addressing, and `BASE` likewise rejects external expressions.
+
 ## Run the loader
 
 ```powershell
@@ -73,4 +86,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions, `ORG`, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including signed external modification terms, `ORG`, literal pools and `LTORG`, validated/nested macro expansion, control sections, external symbols, local/external relocation records, and loader relocation.
