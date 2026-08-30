@@ -1,6 +1,6 @@
 # SIC/XE Assembler and Linking Loader
 
-A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, forward `EQU`, `ORG`, object-program validation, and a linking loader.
+A small systems-programming project that implements macro expansion, a two-pass SIC/XE assembler, control sections, program blocks, external definitions/references, relocation records, literal pools, expression algebra, forward `EQU`, `ORG`, object-program contract validation, and a linking loader.
 
 ## Run the assembler
 
@@ -9,6 +9,8 @@ python assembler.py test_xe.asm
 ```
 
 For `program.asm`, the assembler writes `program.expanded.asm`, `program.int`, `program.sym`, `program.obj`, and `program.lst` beside the source file.
+
+Object-program names used by control sections, `EXTDEF`, and `EXTREF` must fit the SIC/XE six-character fixed field: 1–6 ASCII alphanumeric characters beginning with a letter. Duplicate or colliding external namespaces are rejected instead of being silently truncated. Large D/R records are split to the standard 73-character record bound, and generated H/D/R/T/M/E framing is validated before assembly succeeds.
 
 ## Macro processor
 
@@ -94,14 +96,6 @@ MIX      WORD    FIRST+EXT1-EXT2
 
 For `DIFF`, the initial WORD value is `5`, followed by `+EXT1` and `-EXT2` modification records. `MIX` additionally emits a `+<current CSECT>` modification for the local relocatable `FIRST` term. Format-3 instructions reject expressions containing external symbols because they cannot be resolved with 12-bit PC/base-relative addressing, and `BASE` likewise rejects external expressions.
 
-## Object-program contracts
-
-Names written into H/D/R/M fixed fields must be representable without truncation: 1–6 ASCII alphanumeric characters, beginning with a letter. The assembler validates control-section, `EXTDEF`, and `EXTREF` names before Pass 1, rejects duplicate external directives, local/`EXTREF` collisions, and global collisions between CSECT names and `EXTDEF` names.
-
-The unnamed assembler-generated sections use explicit six-character object names (`DEFAUL` and `UNNAME`) rather than relying on accidental string truncation. Large definition/reference sets are emitted as multiple bounded records: D records carry at most six 12-character entries and R records at most twelve 6-character entries, keeping each record within 73 characters.
-
-After Pass 2 the generated object program is validated as framed H/D/R/T/M/E records before assembly succeeds. The linking loader applies the same validator to external object files, so malformed fixed-width names, record lengths, duplicate R entries, unknown record types, and broken section framing fail before ESTAB construction or memory modification.
-
 ## Run the loader
 
 ```powershell
@@ -109,6 +103,8 @@ python loader.py program.obj 4000
 ```
 
 Object programs retain their assembled control-section origin. The loader translates H/T/M/E record addresses to the requested `PROGADDR`, so sources with a non-zero `START` address relocate correctly instead of being loaded at `PROGADDR + START`.
+
+Before ESTAB construction or memory mutation, the loader validates the complete section semantics: H ranges must stay within 24-bit source space; D offsets may denote the one-past-end location but not beyond it; T records may arrive out of address order but may not overlap; every M field must lie inside the section, be fully backed by loaded T bytes, and name either the current control section or a symbol declared by R; execution addresses are end-exclusive for non-empty sections. Across all linked inputs only one explicit execution address is accepted, preventing later object files from silently overriding the program entry point.
 
 ## Verify the checked-in fixtures
 
@@ -120,4 +116,4 @@ The verifier assembles `test.asm`, `test_macro.asm`, `test_csect.asm`, and `test
 
 ## Scope
 
-This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, external symbols, local/external relocation records, and loader relocation.
+This is an educational SIC/XE implementation, not a production toolchain. The fixtures cover the complete SIC/XE instruction table, format 1–4 encoding, PC/base-relative addressing, SIC/XE relocation expressions including forward `EQU` dependencies and signed external modification terms, `ORG`, `USE` program blocks, literal pools and `LTORG`, validated/nested macro expansion, control sections, fixed-field object-program contracts, external symbols, local/external relocation records, semantic loader validation, and loader relocation.
