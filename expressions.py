@@ -7,6 +7,15 @@ class ExpressionValue:
     relocatable: bool
 
 
+@dataclass(frozen=True)
+class LinkExpressionValue:
+    """An object-field value plus the relocation terms the linker must apply."""
+
+    value: int
+    local_relocation_factor: int
+    external_terms: tuple
+
+
 def parse_integer(token):
     text = token.strip()
     if text.lower().startswith('0x'):
@@ -65,7 +74,7 @@ def _resolve_term(token, current_location, symtab, relocatable_symbols):
 
 
 def evaluate_expression(expression, current_location, symtab, relocatable_symbols):
-    """Evaluate additive SIC/XE expressions and enforce relocation algebra.
+    """Evaluate additive local SIC/XE expressions and enforce relocation algebra.
 
     Absolute terms contribute no relocation factor; relocatable symbols and `*`
     contribute +1 or -1 according to their sign. A final relocation factor of 0
@@ -92,3 +101,60 @@ def evaluate_expression(expression, current_location, symtab, relocatable_symbol
         )
 
     return ExpressionValue(value, relocation_factor == 1)
+
+
+def evaluate_link_expression(
+    expression,
+    current_location,
+    csect_start,
+    symtab,
+    relocatable_symbols,
+    external_symbols,
+):
+    """Evaluate an additive expression for a relocatable object-code field.
+
+    Local relocatable terms are stored section-relative and represented by a
+    relocation factor for the current control section. External symbols
+    contribute zero to the initial field and are returned as signed linker
+    modification terms. Purely local expressions retain the normal SIC/XE
+    legality rule (relative balance must be 0 or +1).
+    """
+    if not expression:
+        raise ValueError("Expression is required")
+
+    external_symbols = set(external_symbols)
+    value = 0
+    local_factor = 0
+    external_terms = []
+
+    for sign, token in _split_terms(expression):
+        if token in external_symbols:
+            external_terms.append((sign, token))
+            continue
+
+        if token == '*':
+            value += sign * (current_location - csect_start)
+            local_factor += sign
+            continue
+
+        try:
+            value += sign * parse_integer(token)
+            continue
+        except ValueError:
+            pass
+
+        if token not in symtab:
+            raise ValueError(f"Undefined symbol {token}")
+
+        if token in relocatable_symbols:
+            value += sign * (symtab[token] - csect_start)
+            local_factor += sign
+        else:
+            value += sign * symtab[token]
+
+    if not external_terms and local_factor not in (0, 1):
+        raise ValueError(
+            f"Illegal relocatable expression (relative term balance {local_factor}): {expression}"
+        )
+
+    return LinkExpressionValue(value, local_factor, tuple(external_terms))
