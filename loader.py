@@ -1,6 +1,11 @@
 import os
 import sys
 
+from address_space import (
+    SICXE_MEMORY_SIZE,
+    validate_machine_address,
+    validate_machine_range,
+)
 from loader_semantics import analyze_object_records
 
 
@@ -27,7 +32,22 @@ def parse_obj_file(filepath):
     return records
 
 
+def _validate_progaddr(progaddr):
+    try:
+        validate_machine_address(progaddr, "PROGADDR")
+    except ValueError as exc:
+        raise LoaderError(str(exc)) from exc
+
+
+def _validate_section_placement(csaddr, length, name):
+    try:
+        validate_machine_range(csaddr, length, f"Loaded control section {name}")
+    except ValueError as exc:
+        raise LoaderError(str(exc)) from exc
+
+
 def pass1(obj_files, progaddr):
+    _validate_progaddr(progaddr)
     estab = {}
     csaddr = progaddr
 
@@ -35,6 +55,8 @@ def pass1(obj_files, progaddr):
         _, sections = _load_object(file)
         for section in sections:
             csect_name = section['name']
+            _validate_section_placement(csaddr, section['length'], csect_name)
+
             if csect_name in estab:
                 raise LoaderError(f"Duplicate external symbol {csect_name}")
             estab[csect_name] = csaddr
@@ -55,15 +77,17 @@ def _check_memory_range(memory, start, length, description):
 
 
 def pass2(obj_files, progaddr, estab):
+    _validate_progaddr(progaddr)
     csaddr = progaddr
     exec_addr = progaddr
     explicit_execution_seen = False
-    memory = bytearray(65536)
+    memory = bytearray(SICXE_MEMORY_SIZE)
 
     for file in obj_files:
         _, sections = _load_object(file)
         for section in sections:
             current_cslth = section['length']
+            _validate_section_placement(csaddr, current_cslth, section['name'])
             _check_memory_range(memory, csaddr, current_cslth, "Control section")
 
             for text in section['texts']:
@@ -130,13 +154,13 @@ def print_estab(estab):
     print(f"{'Symbol Name':<15} {'Address':<10}")
     print("-" * 30)
     for sym, addr in estab.items():
-        print(f"{sym:<15} {addr:04X}")
+        print(f"{sym:<15} {addr:05X}")
     print("=" * 30 + "\n")
 
 
 def dump_memory(memory, start_addr, length):
     print("=" * 65)
-    print(f"Memory Dump ({start_addr:04X} - {start_addr + length - 1:04X})")
+    print(f"Memory Dump ({start_addr:05X} - {start_addr + length - 1:05X})")
     print("-" * 65)
 
     end_addr = min(start_addr + length, len(memory))
@@ -147,7 +171,7 @@ def dump_memory(memory, start_addr, length):
         row = memory[addr:min(addr + 16, len(memory))]
         hex_data = " ".join(f"{byte:02X}" for byte in row).ljust(47)
         ascii_data = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in row)
-        print(f"{addr:04X}  {hex_data}  |{ascii_data}|")
+        print(f"{addr:05X}  {hex_data}  |{ascii_data}|")
     print("=" * 65 + "\n")
 
 
@@ -174,11 +198,11 @@ def main():
         return 1
 
     try:
-        print(f"Loading {len(obj_files)} object files starting at PROGADDR {progaddr:04X}...")
+        print(f"Loading {len(obj_files)} object files starting at PROGADDR {progaddr:05X}...")
         estab = pass1(obj_files, progaddr)
         print_estab(estab)
         memory, exec_addr = pass2(obj_files, progaddr, estab)
-        print(f"Load complete. Execution start address: {exec_addr:04X}\n")
+        print(f"Load complete. Execution start address: {exec_addr:05X}\n")
 
         total_len = 0
         for file in obj_files:
