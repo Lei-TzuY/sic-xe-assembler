@@ -1,8 +1,8 @@
 # SIC/XE Assembler and Linking Loader
 
-A dependency-free Python implementation of a SIC/XE macro assembler and linking loader, with unusually strict semantic validation, deterministic linking, reproducible output artifacts, and independent artifact verification.
+A dependency-free Python implementation of a SIC/XE macro assembler and linking loader, with unusually strict semantic validation, deterministic linking, reproducible output artifacts, independent artifact verification, structured inspection, and instruction disassembly.
 
-The project started as a conventional two-pass assembler and now covers the complete SIC/XE instruction table, macros, literals, program blocks, control sections, relocation expressions, a validated load-plan model, a 1 MiB machine-memory model, persistent link maps, deterministic linked images, and end-to-end reproducibility checks.
+The project started as a conventional two-pass assembler and now covers the complete SIC/XE instruction table, macros, literals, program blocks, control sections, relocation expressions, a validated load-plan model, a 1 MiB machine-memory model, persistent link maps, deterministic linked images, end-to-end reproducibility checks, object/manifest inspection, and formats 1–4 disassembly.
 
 ## Quick start
 
@@ -10,8 +10,11 @@ Use the unified CLI for new workflows:
 
 ```powershell
 python sicxe.py assemble program.asm
+python sicxe.py inspect program.obj --disassemble
 python sicxe.py link program.obj --progaddr 4000
+python sicxe.py inspect program.manifest.json
 python sicxe.py verify program.bin program.manifest.json program.obj
+python sicxe.py disasm program.bin --manifest program.manifest.json
 ```
 
 The historical entry points remain supported:
@@ -40,6 +43,8 @@ No third-party runtime packages are required.
 | Machine model | 20-bit SIC/XE address space / 1 MiB memory; independent 24-bit WORD values |
 | Reproducibility | immutable object snapshots, INPUTSET, LINKID, deterministic `.map/.bin/manifest` |
 | Verification | independent re-link and byte-for-byte artifact reproduction |
+| Inspection | validated CSECT/D/R/T/M/E reports, manifest/image SHA checks, JSON output |
+| Disassembly | formats 1–4, format-2 signatures, nixbpe, PC/base targets, deterministic fallback |
 
 ## Assembly pipeline
 
@@ -169,7 +174,33 @@ It reads the persisted binary/manifest, captures the supplied objects again, rec
 
 This detects binary tampering, substituted or reordered object inputs, manifest metadata changes, wrong PROGADDR/link identity, and noncanonical manifest serialization.
 
-See [`docs/toolchain-cli.md`](docs/toolchain-cli.md).
+## Inspection and disassembly
+
+Inspection makes object/link state explainable without mutating it:
+
+```powershell
+python sicxe.py inspect program.obj
+python sicxe.py inspect program.obj --disassemble
+python sicxe.py inspect program.obj --json
+python sicxe.py inspect program.manifest.json
+```
+
+Object inspection first runs the shared object semantic analyzer, then reports raw SHA-256, CSECT ranges, D/R/T/M/E records, exact text bytes, relocation fields, entry data, and summary counts. `--disassemble` additionally linear-sweeps each T payload and attaches any intersecting M records to the decoded record.
+
+Manifest inspection reports image range/SHA, INPUTSET, LINKID, ordered input identities, section placement, and entry provenance. An adjacent `.bin` is auto-detected and compared for current length/SHA. This is deliberately lighter than `verify`: inspection observes persisted state; verification independently re-links it.
+
+Raw linked images can be decoded directly:
+
+```powershell
+python sicxe.py disasm program.bin --manifest program.manifest.json
+python sicxe.py disasm program.bin --start 4000 --base 8000
+```
+
+The disassembler handles formats 1–4, register/shift/SVC format-2 signatures, `nixbpe`, immediate/indirect/indexed syntax, PC-relative targets, optional base-relative target resolution, and 20-bit format-4 targets. Unknown/truncated bytes fall back to one-byte `.BYTE` records so the sweep remains deterministic.
+
+A flat SIC/XE image does not carry a general code/data map, so disassembly is intentionally a linear-sweep decoder rather than a claim to reconstruct original source. `WORD`, `BYTE`, literals, and tables may coincidentally resemble valid instructions.
+
+See [`docs/toolchain-cli.md`](docs/toolchain-cli.md) and [`docs/inspection-disassembly.md`](docs/inspection-disassembly.md).
 
 ## Testing
 
@@ -183,7 +214,7 @@ python verify.py
 
 `verify.py` assembles the four checked-in fixture programs in an isolated temporary directory and byte-compares `.expanded.asm`, `.int`, `.sym`, `.obj`, and `.lst` against the tracked golden outputs.
 
-GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 3.13. Byte-for-byte golden fixture verification runs on Linux, while the cross-platform matrix exercises filesystem behavior, atomic artifact writes, the unified CLI, linking, and reproducibility verification.
+GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 3.13. Byte-for-byte golden fixture verification runs on Linux, while the cross-platform matrix exercises filesystem behavior, atomic artifact writes, the unified CLI, linking, reproducibility verification, inspection, and disassembly.
 
 ## Documentation
 
@@ -193,7 +224,8 @@ GitHub Actions runs the unit suite across Ubuntu and Windows on Python 3.10 and 
 - [`docs/link-map.md`](docs/link-map.md) — stable linker map / cross-reference format
 - [`docs/linked-image.md`](docs/linked-image.md) — binary image and manifest contract
 - [`docs/toolchain-cli.md`](docs/toolchain-cli.md) — unified CLI, verifier, and expression grammar
+- [`docs/inspection-disassembly.md`](docs/inspection-disassembly.md) — inspectors, disassembler, and code/data limitation
 
 ## Scope
 
-This remains an educational SIC/XE implementation rather than a production-system linker, but correctness is treated as a first-class goal: malformed inputs fail hard, relocation is explicit, address-space limits are enforced, output provenance is recorded, and final linked artifacts can be independently reproduced and verified.
+This remains an educational SIC/XE implementation rather than a production-system linker, but correctness is treated as a first-class goal: malformed inputs fail hard, relocation is explicit, address-space limits are enforced, output provenance is recorded, final linked artifacts can be independently reproduced and verified, and every persistent stage can be inspected without hiding the limits of flat-image disassembly.
