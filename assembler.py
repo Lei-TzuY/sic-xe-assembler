@@ -3,7 +3,8 @@ import sys
 
 from errors import AssemblyError
 from macro import run_macro_processor
-from pass1 import run_pass1
+from object_format import canonicalize_object_file, validate_source_object_contracts
+from pass1 import parse_line, run_pass1
 from pass2 import run_pass2
 
 
@@ -39,12 +40,16 @@ def main(argv=None):
         run_macro_processor(asm_file, expanded_file)
         print(f"Macro Processor completed. Generated: {expanded_file}")
 
+        print("Validating object-program contracts...")
+        validate_source_object_contracts(expanded_file, parse_line)
+
         print("Starting Pass 1...")
         csects, start_addr = run_pass1(expanded_file, int_file, sym_file)
         print(f"Pass 1 completed. Found {len(csects)} CSECT(s).")
 
         print("Starting Pass 2...")
         run_pass2(int_file, obj_file, lst_file, csects, start_addr)
+        canonicalize_object_file(obj_file)
         print(
             f"Pass 2 completed. Outputs generated: "
             f"{int_file}, {sym_file}, {obj_file}, {lst_file}"
