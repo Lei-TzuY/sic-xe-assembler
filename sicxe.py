@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -13,6 +14,14 @@ from inspector import (
     inspect_object_file,
     render_manifest_inspection,
     render_object_inspection,
+)
+from source_map import (
+    SourceMapError,
+    load_linked_debug_map,
+    load_source_map,
+    render_linked_debug_inspection,
+    render_source_map_inspection,
+    render_typed_disassembly,
 )
 
 
@@ -41,7 +50,7 @@ def build_parser():
         prog="sicxe.py",
         description=(
             "SIC/XE assembler, reproducible linker, artifact verifier, inspector, "
-            "and disassembler"
+            "and source-aware disassembler"
         ),
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -49,7 +58,7 @@ def build_parser():
     assemble = subcommands.add_parser("assemble", help="assemble one SIC/XE source file")
     assemble.add_argument("source", help="assembly source (.asm)")
 
-    link = subcommands.add_parser("link", help="link object files and emit .map/.bin/manifest")
+    link = subcommands.add_parser("link", help="link object files and emit .map/.bin/manifest/debug")
     link.add_argument("objects", nargs="+", help="object inputs in link order")
     link.add_argument(
         "--progaddr",
@@ -69,9 +78,9 @@ def build_parser():
 
     inspect = subcommands.add_parser(
         "inspect",
-        help="inspect a validated .obj or linked .manifest.json artifact",
+        help="inspect .obj, .manifest.json, .sourcemap.json, or .debug.json artifacts",
     )
-    inspect.add_argument("artifact", help="object file or linked-image manifest")
+    inspect.add_argument("artifact", help="artifact to inspect")
     inspect.add_argument(
         "--image",
         help="linked .bin image to compare with a manifest (auto-detected when adjacent)",
@@ -85,7 +94,7 @@ def build_parser():
         "--base",
         type=_parse_hex_address,
         metavar="HEX",
-        help="optional B-register value for base-relative disassembly",
+        help="optional B-register value for base-relative object disassembly",
     )
     inspect.add_argument(
         "--json",
@@ -95,18 +104,27 @@ def build_parser():
 
     disasm = subcommands.add_parser(
         "disasm",
-        help="linear-sweep a raw linked image as SIC/XE instructions",
+        help="decode a linked image, using typed source metadata when available",
     )
     disasm.add_argument("image", help="raw linked .bin image")
     disasm.add_argument(
         "--start",
         type=_parse_hex_address,
         metavar="HEX",
-        help="address corresponding to the first byte (default: 0 unless --manifest is used)",
+        help="address corresponding to the first byte (default: 0 unless metadata is used)",
     )
     disasm.add_argument(
         "--manifest",
         help="linked-image manifest from which to derive/validate the image start",
+    )
+    disasm.add_argument(
+        "--debug",
+        help="linked .debug.json source map (auto-detected beside the image when present)",
+    )
+    disasm.add_argument(
+        "--linear",
+        action="store_true",
+        help="ignore typed debug metadata and force the historical linear sweep",
     )
     disasm.add_argument(
         "--base",
@@ -131,7 +149,7 @@ def build_parser():
         "--max-instructions",
         type=_parse_nonnegative_int,
         metavar="N",
-        help="stop after at most N decoded records",
+        help="stop after at most N decoded instruction records",
     )
 
     return parser
@@ -162,6 +180,15 @@ def _default_image_for_manifest(path):
     return str(candidate) if candidate.exists() else None
 
 
+def _adjacent_object_for_source_map(path):
+    text = str(path)
+    suffix = ".sourcemap.json"
+    if not text.endswith(suffix):
+        return None
+    candidate = Path(text[:-len(suffix)] + ".obj")
+    return candidate if candidate.exists() else None
+
+
 def _run_inspect(args):
     artifact = str(args.artifact)
     try:
@@ -188,11 +215,31 @@ def _run_inspect(args):
                 if args.json
                 else render_manifest_inspection(report)
             )
+        elif artifact.endswith(".sourcemap.json"):
+            if args.disassemble or args.image or args.base is not None:
+                raise InspectionError("source-map inspection does not use --image/--base/--disassemble")
+            adjacent = _adjacent_object_for_source_map(artifact)
+            object_sha = hashlib.sha256(adjacent.read_bytes()).hexdigest() if adjacent else None
+            report, _ = load_source_map(artifact, object_sha256=object_sha)
+            output = (
+                json.dumps(report, indent=2, sort_keys=True) + "\n"
+                if args.json
+                else render_source_map_inspection(report)
+            )
+        elif artifact.endswith(".debug.json"):
+            if args.disassemble or args.image or args.base is not None:
+                raise InspectionError("linked-debug inspection does not use --image/--base/--disassemble")
+            report, _ = load_linked_debug_map(artifact)
+            output = (
+                json.dumps(report, indent=2, sort_keys=True) + "\n"
+                if args.json
+                else render_linked_debug_inspection(report)
+            )
         else:
             raise InspectionError(
-                "inspect expects a .obj or .manifest.json artifact"
+                "inspect expects .obj, .manifest.json, .sourcemap.json, or .debug.json"
             )
-    except InspectionError as exc:
+    except (InspectionError, SourceMapError, OSError) as exc:
         print(f"Inspection failed: {exc}", file=sys.stderr)
         return 1
 
@@ -200,12 +247,16 @@ def _run_inspect(args):
     return 0
 
 
-def _manifest_image_start(path):
+def _manifest_report(path):
     try:
-        report = inspect_image_manifest(path)
+        return inspect_image_manifest(path)
     except InspectionError as exc:
         raise ValueError(str(exc)) from exc
-    return report["image_start"]
+
+
+def _default_debug_for_image(image_path):
+    candidate = Path(image_path).with_suffix(".debug.json")
+    return str(candidate) if candidate.exists() else None
 
 
 def _run_disasm(args):
@@ -216,12 +267,14 @@ def _run_disasm(args):
         return 1
 
     start = args.start
+    manifest_report = None
     if args.manifest:
         try:
-            manifest_start = _manifest_image_start(args.manifest)
+            manifest_report = _manifest_report(args.manifest)
         except ValueError as exc:
             print(f"Disassembly failed: {exc}", file=sys.stderr)
             return 1
+        manifest_start = manifest_report["image_start"]
         if start is not None and start != manifest_start:
             print(
                 f"Disassembly failed: --start {start:05X} does not match "
@@ -230,6 +283,30 @@ def _run_disasm(args):
             )
             return 1
         start = manifest_start
+
+    debug_path = None if args.linear else (args.debug or _default_debug_for_image(args.image))
+    debug_map = None
+    if debug_path:
+        try:
+            debug_map, _ = load_linked_debug_map(
+                debug_path,
+                link_fingerprint=(
+                    manifest_report["link_fingerprint"] if manifest_report is not None else None
+                ),
+            )
+        except SourceMapError as exc:
+            print(f"Disassembly failed: {exc}", file=sys.stderr)
+            return 1
+        debug_start = debug_map["progaddr"]
+        if start is not None and start != debug_start:
+            print(
+                f"Disassembly failed: image start {start:05X} does not match "
+                f"debug PROGADDR {debug_start:05X}",
+                file=sys.stderr,
+            )
+            return 1
+        start = debug_start
+
     if start is None:
         start = 0
 
@@ -240,6 +317,24 @@ def _run_disasm(args):
             file=sys.stderr,
         )
         return 1
+
+    if debug_map is not None:
+        try:
+            output = render_typed_disassembly(
+                image,
+                start,
+                debug_map,
+                base_register=args.base,
+                offset=offset,
+                length=args.length,
+                max_instructions=args.max_instructions,
+            )
+        except SourceMapError as exc:
+            print(f"Disassembly failed: {exc}", file=sys.stderr)
+            return 1
+        print(output, end="")
+        return 0
+
     end = len(image) if args.length is None else min(len(image), offset + args.length)
     payload = image[offset:end]
     records = disassemble(
