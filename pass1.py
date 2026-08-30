@@ -423,6 +423,11 @@ def run_pass1(asm_file, int_file, sym_file):
                         fail(line_number, str(exc))
                     target_offset = result.value - block['virtual_base']
                     if not 0 <= target_offset <= 0xFFFFFF:
+                        if current_block == '':
+                            fail(
+                                line_number,
+                                f"ORG target outside control section address range: {result.value}",
+                            )
                         fail(
                             line_number,
                             "ORG target must resolve within the current program block",
