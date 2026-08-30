@@ -176,6 +176,82 @@ def _ensure_block(csect, block_name):
     return csect['blocks'][block_name]
 
 
+def _resolve_equ_definitions(csect):
+    """Resolve EQU symbols after program-block addresses have been finalized."""
+    resolved_symtab = {
+        symbol: csect['symtab'][symbol]
+        for symbol in csect['symbol_blocks']
+    }
+    resolved_relocatable = set(csect['symbol_blocks'])
+    resolved = set()
+    resolving = []
+
+    def resolve(symbol):
+        if symbol in resolved:
+            return
+
+        if symbol in resolving:
+            cycle_start = resolving.index(symbol)
+            cycle = resolving[cycle_start:] + [symbol]
+            current_symbol = resolving[-1]
+            definition = csect['equ_defs'][current_symbol]
+            raise AssemblyError(
+                f"Circular EQU dependency: {' -> '.join(cycle)}",
+                phase="pass 1",
+                line_number=definition['line_number'],
+            )
+
+        definition = csect['equ_defs'][symbol]
+        block = csect['blocks'][definition['block']]
+        current_location = block['start'] + definition['offset']
+        resolving.append(symbol)
+
+        while True:
+            try:
+                result = evaluate_expression(
+                    definition['expression'],
+                    current_location,
+                    resolved_symtab,
+                    resolved_relocatable,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                prefix = "Undefined symbol "
+                if message.startswith(prefix):
+                    dependency = message[len(prefix):]
+                    if dependency in csect['equ_defs']:
+                        resolve(dependency)
+                        continue
+                raise AssemblyError(
+                    message,
+                    phase="pass 1",
+                    line_number=definition['line_number'],
+                ) from exc
+            break
+
+        if not 0 <= result.value <= 0xFFFFFF:
+            raise AssemblyError(
+                f"EQU value out of range: {result.value}",
+                phase="pass 1",
+                line_number=definition['line_number'],
+            )
+
+        resolved_symtab[symbol] = result.value
+        if result.relocatable:
+            resolved_relocatable.add(symbol)
+        else:
+            resolved_relocatable.discard(symbol)
+        resolving.pop()
+        resolved.add(symbol)
+
+    for symbol in csect['equ_order']:
+        resolve(symbol)
+
+    for symbol in csect['equ_order']:
+        csect['symtab'][symbol] = resolved_symtab[symbol]
+    csect['relocatable'] = resolved_relocatable
+
+
 def _finalize_csect(csect):
     if csect['finalized']:
         return
@@ -195,26 +271,7 @@ def _finalize_csect(csect):
         block = csect['blocks'][block_name]
         csect['symtab'][symbol] = block['start'] + offset
 
-    ordinary_relocatable = set(csect['symbol_blocks'])
-    csect['relocatable'] = ordinary_relocatable
-
-    for symbol in csect['equ_order']:
-        definition = csect['equ_defs'][symbol]
-        block = csect['blocks'][definition['block']]
-        current_location = block['start'] + definition['offset']
-        result = evaluate_expression(
-            definition['expression'],
-            current_location,
-            csect['symtab'],
-            csect['relocatable'],
-        )
-        if not 0 <= result.value <= 0xFFFFFF:
-            raise ValueError(f"EQU value out of range: {result.value}")
-        csect['symtab'][symbol] = result.value
-        if result.relocatable:
-            csect['relocatable'].add(symbol)
-        else:
-            csect['relocatable'].discard(symbol)
+    _resolve_equ_definitions(csect)
 
     for entry in csect['literals'].values():
         if entry['block'] is not None:
@@ -297,7 +354,7 @@ def run_pass1(asm_file, int_file, sym_file):
         def define_label(csect, label, line_number):
             if not label:
                 return
-            if label in csect['symtab']:
+            if label in csect['symtab'] or label in csect['equ_defs']:
                 fail(line_number, f"Duplicate label {label} in {current_csect}")
             block = current_block_data()
             csect['symtab'][label] = _block_location(block)
@@ -387,8 +444,19 @@ def run_pass1(asm_file, int_file, sym_file):
             if opcode == 'EQU':
                 if not label:
                     fail(line_number, "EQU requires a label")
-                if label in csect['symtab']:
+                if not operand:
+                    fail(line_number, "Expression is required")
+                if label in csect['symtab'] or label in csect['equ_defs']:
                     fail(line_number, f"Duplicate label {label} in {current_csect}")
+
+                csect['equ_defs'][label] = {
+                    'expression': operand,
+                    'block': current_block,
+                    'offset': block['locctr'],
+                    'line_number': line_number,
+                }
+                csect['equ_order'].append(label)
+
                 try:
                     result = evaluate_expression(
                         operand,
@@ -397,16 +465,16 @@ def run_pass1(asm_file, int_file, sym_file):
                         csect['relocatable'],
                     )
                 except ValueError as exc:
-                    fail(line_number, str(exc))
-                csect['symtab'][label] = result.value
-                if result.relocatable:
-                    csect['relocatable'].add(label)
-                csect['equ_defs'][label] = {
-                    'expression': operand,
-                    'block': current_block,
-                    'offset': block['locctr'],
-                }
-                csect['equ_order'].append(label)
+                    if not str(exc).startswith("Undefined symbol "):
+                        fail(line_number, str(exc))
+                else:
+                    if not 0 <= result.value <= 0xFFFFFF:
+                        fail(line_number, f"EQU value out of range: {result.value}")
+                    csect['symtab'][label] = result.value
+                    if result.relocatable:
+                        csect['relocatable'].add(label)
+                    else:
+                        csect['relocatable'].discard(label)
                 continue
 
             if opcode == 'ORG':
