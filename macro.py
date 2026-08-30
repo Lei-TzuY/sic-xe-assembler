@@ -194,7 +194,26 @@ def _collect_definition(lines, start_index, macros):
     _fail(line_number, f"Unterminated MACRO definition: {label}")
 
 
-def _expand_macro(definition, label, operand, line_number, macros, counter, stack):
+def _provenance(source_line, definition_line=None, macro_stack=(), generated=None):
+    return {
+        "source_line": source_line,
+        "definition_line": definition_line,
+        "macro_stack": tuple(dict(frame) for frame in macro_stack),
+        "generated": generated,
+    }
+
+
+def _expand_macro(
+    definition,
+    label,
+    operand,
+    line_number,
+    macros,
+    counter,
+    stack,
+    root_source_line=None,
+    frames=(),
+):
     if definition.name in stack:
         chain = " -> ".join(stack + [definition.name])
         _fail(line_number, f"Recursive macro expansion detected: {chain}")
@@ -213,13 +232,41 @@ def _expand_macro(definition, label, operand, line_number, macros, counter, stac
 
     replacements = dict(zip(definition.parameters, arguments))
     counter[0] += 1
-    local_prefix = f"__{definition.name}_{counter[0]:04d}_"
-    expanded = [f". Macro Expansion: {definition.name}"]
+    expansion_id = counter[0]
+    local_prefix = f"__{definition.name}_{expansion_id:04d}_"
+    root_source_line = line_number if root_source_line is None else root_source_line
+    frame = {
+        "name": definition.name,
+        "expansion_id": expansion_id,
+        "invocation_line": line_number,
+        "definition_line": definition.line_number,
+    }
+    next_frames = tuple(frames) + (frame,)
+    expanded = [
+        (
+            f". Macro Expansion: {definition.name}",
+            _provenance(
+                root_source_line,
+                definition_line=definition.line_number,
+                macro_stack=next_frames,
+                generated="macro-expansion-marker",
+            ),
+        )
+    ]
 
     # Preserve the historical standalone invocation label so existing fixtures and
     # pass-1 label semantics remain stable.
     if label:
-        expanded.append(label)
+        expanded.append(
+            (
+                label,
+                _provenance(
+                    root_source_line,
+                    macro_stack=next_frames,
+                    generated="invocation-label",
+                ),
+            )
+        )
 
     next_stack = stack + [definition.name]
     for body_line, body_line_number in definition.body:
@@ -236,21 +283,47 @@ def _expand_macro(definition, label, operand, line_number, macros, counter, stac
                     macros,
                     counter,
                     next_stack,
+                    root_source_line=root_source_line,
+                    frames=next_frames,
                 )
             )
         else:
-            expanded.append(substituted)
+            expanded.append(
+                (
+                    substituted,
+                    _provenance(
+                        root_source_line,
+                        definition_line=body_line_number,
+                        macro_stack=next_frames,
+                    ),
+                )
+            )
 
     return expanded
 
 
 def run_macro_processor(input_asm, output_asm):
-    """Expand SIC/XE macros with validated parameters and deterministic local labels."""
+    """Expand macros and return deterministic original-source provenance.
+
+    The emitted expanded source remains byte-for-byte compatible with the
+    historical processor. The returned trace has one entry per expanded output
+    line and records the root source line plus the complete nested macro stack.
+    """
     macros = {}
     counter = [0]
+    trace = []
 
     with open(input_asm, 'r') as f_in:
         lines = f_in.readlines()
+
+    def write_line(f_out, text, provenance, preserve_newline=False):
+        if preserve_newline:
+            f_out.write(text)
+        else:
+            f_out.write(text + "\n")
+        item = dict(provenance)
+        item["expanded_line"] = len(trace) + 1
+        trace.append(item)
 
     with open(output_asm, 'w') as f_out:
         index = 0
@@ -276,9 +349,16 @@ def run_macro_processor(input_asm, output_asm):
                     counter,
                     [],
                 )
-                for expanded_line in expanded:
-                    f_out.write(expanded_line + "\n")
+                for expanded_line, provenance in expanded:
+                    write_line(f_out, expanded_line, provenance)
             else:
-                f_out.write(line)
+                write_line(
+                    f_out,
+                    line,
+                    _provenance(line_number),
+                    preserve_newline=True,
+                )
 
             index += 1
+
+    return tuple(trace)
