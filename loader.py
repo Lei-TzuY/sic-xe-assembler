@@ -1,23 +1,29 @@
 import os
 import sys
 
-from object_format import validate_object_records
+from loader_semantics import analyze_object_records
 
 
 class LoaderError(Exception):
     pass
 
 
-def parse_obj_file(filepath):
+def _load_object(filepath):
     records = []
     with open(filepath, 'r') as f:
         for line in f:
             if line.strip():
                 records.append(line.strip('\n'))
     try:
-        validate_object_records(records)
+        sections = analyze_object_records(records)
     except ValueError as exc:
         raise LoaderError(f"Invalid object program {filepath}: {exc}") from exc
+    return records, sections
+
+
+def parse_obj_file(filepath):
+    """Read an object file after validating both framing and loader semantics."""
+    records, _ = _load_object(filepath)
     return records
 
 
@@ -26,46 +32,19 @@ def pass1(obj_files, progaddr):
     csaddr = progaddr
 
     for file in obj_files:
-        records = parse_obj_file(file)
-        current_cslth = 0
-        saw_header = False
+        _, sections = _load_object(file)
+        for section in sections:
+            csect_name = section['name']
+            if csect_name in estab:
+                raise LoaderError(f"Duplicate external symbol {csect_name}")
+            estab[csect_name] = csaddr
 
-        for record in records:
-            if record.startswith('H'):
-                if len(record) < 19:
-                    raise LoaderError(f"Malformed H record in {file}: {record}")
-                csect_name = record[1:7].strip()
-                current_cslth = int(record[13:19], 16)
-                saw_header = True
+            for sym_name, sym_offset in section['definitions']:
+                if sym_name in estab:
+                    raise LoaderError(f"Duplicate external symbol {sym_name}")
+                estab[sym_name] = csaddr + sym_offset
 
-                if csect_name in estab:
-                    raise LoaderError(f"Duplicate external symbol {csect_name}")
-                estab[csect_name] = csaddr
-
-            elif record.startswith('D'):
-                if not saw_header:
-                    raise LoaderError(f"D record before H record in {file}")
-                payload = record[1:]
-                if len(payload) % 12:
-                    raise LoaderError(f"Malformed D record in {file}: {record}")
-                for idx in range(0, len(payload), 12):
-                    sym_name = payload[idx:idx + 6].strip()
-                    sym_addr = int(payload[idx + 6:idx + 12], 16)
-                    if not sym_name:
-                        raise LoaderError(f"Empty symbol in D record: {record}")
-                    if sym_name in estab:
-                        raise LoaderError(f"Duplicate external symbol {sym_name}")
-                    estab[sym_name] = csaddr + sym_addr
-
-            elif record.startswith('E'):
-                if not saw_header:
-                    raise LoaderError(f"E record before H record in {file}")
-                csaddr += current_cslth
-                saw_header = False
-                current_cslth = 0
-
-        if saw_header:
-            raise LoaderError(f"Missing E record in {file}")
+            csaddr += section['length']
 
     return estab
 
@@ -78,68 +57,37 @@ def _check_memory_range(memory, start, length, description):
 def pass2(obj_files, progaddr, estab):
     csaddr = progaddr
     exec_addr = progaddr
+    explicit_execution_seen = False
     memory = bytearray(65536)
 
     for file in obj_files:
-        records = parse_obj_file(file)
-        current_cslth = 0
-        header_start = 0
-        saw_header = False
+        _, sections = _load_object(file)
+        for section in sections:
+            current_cslth = section['length']
+            _check_memory_range(memory, csaddr, current_cslth, "Control section")
 
-        for record in records:
-            if record.startswith('H'):
-                if len(record) < 19:
-                    raise LoaderError(f"Malformed H record in {file}: {record}")
-                header_start = int(record[7:13], 16)
-                current_cslth = int(record[13:19], 16)
-                saw_header = True
-                _check_memory_range(memory, csaddr, current_cslth, "Control section")
+            for text in section['texts']:
+                start_addr = csaddr + text['offset']
+                _check_memory_range(memory, start_addr, text['length'], "Text record")
+                memory[start_addr:start_addr + text['length']] = text['data']
 
-            elif record.startswith('T'):
-                if not saw_header or len(record) < 9:
-                    raise LoaderError(f"Malformed T record in {file}: {record}")
-                record_start = int(record[1:7], 16)
-                length = int(record[7:9], 16)
-                code_hex = record[9:]
-                if len(code_hex) != length * 2:
-                    raise LoaderError(f"T record length mismatch in {file}: {record}")
-                offset = record_start - header_start
-                if offset < 0 or offset + length > current_cslth:
-                    raise LoaderError(f"T record lies outside control section: {record}")
-                start_addr = csaddr + offset
-                _check_memory_range(memory, start_addr, length, "Text record")
-
-                try:
-                    code = bytes.fromhex(code_hex)
-                except ValueError as exc:
-                    raise LoaderError(f"Invalid hexadecimal data in T record: {record}") from exc
-                memory[start_addr:start_addr + length] = code
-
-            elif record.startswith('M'):
-                if not saw_header or len(record) < 11:
-                    raise LoaderError(f"Malformed M record in {file}: {record}")
-                record_addr = int(record[1:7], 16)
-                mod_len = int(record[7:9], 16)
-                sign = record[9]
-                sym_name = record[10:].strip()
-                if mod_len not in (5, 6):
-                    raise LoaderError(f"Unsupported modification length {mod_len}: {record}")
-                if sign not in '+-':
-                    raise LoaderError(f"Invalid modification sign: {record}")
+            # Apply modifications only after all text bytes for the section have
+            # been materialized. The semantic analyzer guarantees that every
+            # three-byte modification field is fully backed by T records.
+            for modification in section['modifications']:
+                sym_name = modification['symbol']
                 if sym_name not in estab:
                     raise LoaderError(f"Undefined external symbol {sym_name}")
 
-                offset = record_addr - header_start
-                if offset < 0 or offset + 3 > current_cslth:
-                    raise LoaderError(f"M record lies outside control section: {record}")
-                mod_addr = csaddr + offset
+                mod_addr = csaddr + modification['offset']
                 _check_memory_range(memory, mod_addr, 3, "Modification record")
-
                 val = (
                     (memory[mod_addr] << 16)
                     | (memory[mod_addr + 1] << 8)
                     | memory[mod_addr + 2]
                 )
+
+                mod_len = modification['half_bytes']
                 if mod_len == 5:
                     target = val & 0x0FFFFF
                     keep_mask = 0xF00000
@@ -150,7 +98,10 @@ def pass2(obj_files, progaddr, estab):
                     width_mask = 0xFFFFFF
 
                 sym_val = estab[sym_name]
-                target = target + sym_val if sign == '+' else target - sym_val
+                if modification['sign'] == '+':
+                    target += sym_val
+                else:
+                    target -= sym_val
                 target &= width_mask
                 val = (val & keep_mask) | target
 
@@ -158,22 +109,16 @@ def pass2(obj_files, progaddr, estab):
                 memory[mod_addr + 1] = (val >> 8) & 0xFF
                 memory[mod_addr + 2] = val & 0xFF
 
-            elif record.startswith('E'):
-                if not saw_header:
-                    raise LoaderError(f"E record before H record in {file}")
-                if len(record) > 1:
-                    source_exec = int(record[1:7], 16)
-                    offset = source_exec - header_start
-                    if not 0 <= offset <= current_cslth:
-                        raise LoaderError(f"Execution address lies outside control section: {record}")
-                    exec_addr = csaddr + offset
-                csaddr += current_cslth
-                saw_header = False
-                current_cslth = 0
-                header_start = 0
+            source_exec = section['execution_address']
+            if source_exec is not None:
+                if explicit_execution_seen:
+                    raise LoaderError(
+                        "Multiple explicit execution addresses across object inputs"
+                    )
+                explicit_execution_seen = True
+                exec_addr = csaddr + (source_exec - section['start'])
 
-        if saw_header:
-            raise LoaderError(f"Missing E record in {file}")
+            csaddr += current_cslth
 
     return memory, exec_addr
 
@@ -237,9 +182,8 @@ def main():
 
         total_len = 0
         for file in obj_files:
-            for record in parse_obj_file(file):
-                if record.startswith('H'):
-                    total_len += int(record[13:19], 16)
+            _, sections = _load_object(file)
+            total_len += sum(section['length'] for section in sections)
         dump_memory(memory, progaddr, total_len)
         return 0
     except (LoaderError, OSError, ValueError) as exc:
