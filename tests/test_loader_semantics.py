@@ -35,11 +35,11 @@ class LoaderSemanticIntegrityTests(unittest.TestCase):
             "D-record symbol lies outside control section MAIN",
         )
 
-    def test_header_range_must_fit_24_bit_address_space(self):
+    def test_header_range_must_fit_sicxe_machine_memory(self):
         self.assert_parse_rejects(
-            "HMAIN  FFFFFF000002\n"
-            "EFFFFFF\n",
-            "Control section exceeds 24-bit address space",
+            "HMAIN  0FFFFF000002\n"
+            "E0FFFFF\n",
+            "Control section MAIN exceeds 20-bit SIC/XE memory",
         )
 
     def test_text_records_may_be_nonmonotonic_but_cannot_overlap(self):
