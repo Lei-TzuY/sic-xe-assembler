@@ -1,7 +1,7 @@
 from errors import AssemblyError
 from expressions import evaluate_expression
 from opcodes import FORMAT2_SIGNATURES, OPCODES, REGISTERS
-from pass1 import encode_byte_operand, parse_line
+from pass1 import encode_byte_operand, parse_line, parse_literal
 
 
 def _parse_register(token):
@@ -225,6 +225,12 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                 f_lst.write(f"\t\t\t{orig_line}\n")
                 continue
 
+            if opcode == 'LTORG':
+                if operand:
+                    fail(line_number, "LTORG does not take an operand")
+                f_lst.write(f"{addr_str}\t\t\t{orig_line}\n")
+                continue
+
             raw_opcode = opcode[1:] if opcode and opcode.startswith('+') else opcode
 
             if raw_opcode in OPCODES:
@@ -276,7 +282,18 @@ def run_pass2(int_file, obj_file, lst_file, csects, start_addr):
                         target_addr = 0
                         relocatable = False
 
-                        if is_extref:
+                        if op_symbol.startswith('='):
+                            try:
+                                canonical, _ = parse_literal(op_symbol)
+                            except ValueError as exc:
+                                fail(line_number, str(exc))
+                            entry = data['literals'].get(canonical)
+                            if entry is None or entry['address'] is None:
+                                fail(line_number, f"Literal is not assigned in {current_csect}: {op_symbol}")
+                            target_addr = entry['address']
+                            relocatable = True
+                            is_extref = False
+                        elif is_extref:
                             target_addr = 0
                         else:
                             try:
