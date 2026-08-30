@@ -81,6 +81,37 @@ def encode_byte_operand(operand):
     raise ValueError(f"BYTE operand must use C'..' or X'..': {operand}")
 
 
+def parse_literal(literal):
+    """Return canonical literal spelling and object bytes for =C'..' / =X'..'."""
+    if not literal or not literal.startswith('='):
+        raise ValueError(f"Invalid literal: {literal}")
+
+    body = literal[1:]
+    object_code = encode_byte_operand(body)
+    kind = body[0].upper()
+    payload = body[2:-1]
+    if kind == 'X':
+        canonical = f"=X'{object_code}'"
+    else:
+        canonical = f"=C'{payload}'"
+    return canonical, object_code
+
+
+def literal_from_operand(operand):
+    """Extract and validate a literal reference from an instruction operand."""
+    if not operand:
+        return None
+
+    token = operand.strip()
+    if token.startswith(('#', '@')):
+        token = token[1:].strip()
+    if token.upper().endswith(',X'):
+        token = token[:-2].strip()
+    if not token.startswith('='):
+        return None
+    return parse_literal(token)
+
+
 def _parse_nonnegative_decimal(operand, directive):
     if operand is None:
         raise ValueError(f"{directive} requires an operand")
@@ -99,6 +130,8 @@ def _new_csect(start):
         'relocatable': set(),
         'extdef': [],
         'extref': [],
+        'literals': {},
+        'pending_literals': [],
         'start': start,
         'length': 0,
     }
@@ -124,6 +157,37 @@ def run_pass1(asm_file, int_file, sym_file):
     with open(asm_file, 'r') as f_in, open(int_file, 'w') as f_out:
         lines = f_in.readlines()
         first_line = True
+
+        def register_literal(csect, operand, line_number):
+            try:
+                parsed = literal_from_operand(operand)
+            except ValueError as exc:
+                fail(line_number, str(exc))
+            if parsed is None:
+                return
+
+            canonical, object_code = parsed
+            if canonical not in csect['literals']:
+                csect['literals'][canonical] = {
+                    'address': None,
+                    'object_code': object_code,
+                }
+                csect['pending_literals'].append(canonical)
+
+        def flush_literals(csect, line_number):
+            nonlocal locctr
+            pending = csect['pending_literals']
+            for canonical in pending:
+                entry = csect['literals'][canonical]
+                if entry['address'] is not None:
+                    continue
+                entry['address'] = locctr
+                body = canonical[1:]
+                f_out.write(f"{locctr:04X}\t{canonical} BYTE {body}\n")
+                locctr += len(entry['object_code']) // 2
+                if locctr > 0x1000000:
+                    fail(line_number, "Location counter exceeds 24-bit address space")
+            pending.clear()
 
         for line_number, line in enumerate(lines, 1):
             label, opcode, operand, is_comment = parse_line(line)
@@ -154,8 +218,10 @@ def run_pass1(asm_file, int_file, sym_file):
                 fail(line_number, "START must be the first non-comment statement")
 
             if opcode == 'CSECT':
+                current_data = csects[current_csect]
+                flush_literals(current_data, line_number)
                 try:
-                    _finish_csect(csects[current_csect], locctr)
+                    _finish_csect(current_data, locctr)
                 except ValueError as exc:
                     fail(line_number, str(exc))
                 new_csect = label if label else "UNNAMED"
@@ -168,8 +234,10 @@ def run_pass1(asm_file, int_file, sym_file):
                 continue
 
             if opcode == 'END':
+                current_data = csects[current_csect]
+                flush_literals(current_data, line_number)
                 try:
-                    _finish_csect(csects[current_csect], locctr)
+                    _finish_csect(current_data, locctr)
                 except ValueError as exc:
                     fail(line_number, str(exc))
                 f_out.write(f"\t\t{line.strip()}\n")
@@ -218,6 +286,17 @@ def run_pass1(asm_file, int_file, sym_file):
                     csect['relocatable'].add(label)
                 continue
 
+            if opcode == 'LTORG':
+                if operand:
+                    fail(line_number, "LTORG does not take an operand")
+                if label:
+                    if label in csect['symtab']:
+                        fail(line_number, f"Duplicate label {label} in {current_csect}")
+                    csect['symtab'][label] = locctr
+                    csect['relocatable'].add(label)
+                flush_literals(csect, line_number)
+                continue
+
             if label:
                 if label in csect['symtab']:
                     fail(line_number, f"Duplicate label {label} in {current_csect}")
@@ -230,6 +309,8 @@ def run_pass1(asm_file, int_file, sym_file):
                 fail(line_number, str(exc))
 
             if size is not None:
+                if OPCODES[opcode[1:] if opcode.startswith('+') else opcode][1] == 3:
+                    register_literal(csect, operand, line_number)
                 locctr += size
             elif opcode == 'WORD':
                 if operand is None:
@@ -266,5 +347,8 @@ def run_pass1(asm_file, int_file, sym_file):
             f_sym.write(f"CS: {cs_name}\n")
             for lbl, addr in cs_data['symtab'].items():
                 f_sym.write(f"  {lbl}\t{addr:04X}\n")
+            for literal, entry in cs_data['literals'].items():
+                if entry['address'] is not None:
+                    f_sym.write(f"  {literal}\t{entry['address']:04X}\n")
 
     return csects, start_address
