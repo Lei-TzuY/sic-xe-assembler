@@ -229,8 +229,6 @@ def _written_registers(node):
     if mnemonic in ("TIX", "TIXR"):
         return {"X"}
     if mnemonic == "JSUB":
-        # The call instruction itself writes only the link register. Effects of
-        # the resolved callee are composed separately to a fixed point.
         return {"L"}
     if mnemonic in ("LPS", "SVC"):
         return set(TRACKED_REGISTERS)
@@ -302,12 +300,7 @@ def _subroutine_shapes(nodes, edges):
 
 
 def summarize_subroutines(nodes, edges):
-    """Build compositional may-clobber/preserve summaries for resolved callees.
-
-    Direct writes are combined with resolved nested-callee summaries until a
-    monotone fixed point. Unknown calls remain fully opaque. Recursive call
-    cycles are supported because may-clobber sets only grow.
-    """
+    """Build compositional may-clobber/preserve summaries for resolved callees."""
     shapes = _subroutine_shapes(nodes, edges)
     summaries = {}
     all_registers = set(TRACKED_REGISTERS)
@@ -475,6 +468,11 @@ def resolve_dynamic_base_targets(nodes, register_facts):
         facts = register_facts.get(node["address"], {})
         state_in = facts.get("in")
         base_value = None if state_in is None else state_in.get("B")
+        if base_value is None and node.get("target_resolution") == "range-singleton-base":
+            # The interval domain owns this resolution. It will explicitly
+            # revoke it if a later join widens B, avoiding exact/range
+            # fixed-point oscillation.
+            continue
         raw = bytes.fromhex(node["bytes"])
         decoded = decode_instruction(raw, address=node["address"], base_register=base_value)
         new_resolution = "dataflow-base" if base_value is not None and decoded.target is not None else None
