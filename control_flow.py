@@ -1,7 +1,6 @@
-from control_flow_core import ControlFlowError
+from control_flow_core import *
 from control_flow_core import analyze_control_flow as _analyze_control_flow_core
 from control_flow_core import annotate_typed_disassembly as _annotate_typed_disassembly_core
-from control_flow_core import render_control_flow_dot
 from control_flow_core import render_control_flow_report as _render_control_flow_report_core
 from function_analysis import analyze_functions
 from liveness_analysis import analyze_liveness
