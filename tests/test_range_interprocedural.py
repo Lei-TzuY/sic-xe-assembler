@@ -123,7 +123,7 @@ class RangeInterproceduralTests(unittest.TestCase):
             "     LDA VALUE\n"
             "     AND #0\n"
             "     RMO A,B\n"
-            "     BASE MAIN\n"
+            "     BASE 0\n"
             "     J FAR\n"
             "VALUE WORD 123\n"
             "     RESB 3000\n"
