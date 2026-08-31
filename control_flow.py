@@ -1,5 +1,6 @@
 from disassembler import decode_instruction
 from range_analysis import analyze_value_ranges, known_ranges, possible_conditions
+from range_targets import resolve_singleton_base_targets
 from static_analysis import (
     analyze_register_constants,
     known_condition,
@@ -274,6 +275,8 @@ def _resolve_dataflow_targets(nodes, entry_address, initial_base):
             initial_registers,
         )
         if resolve_dynamic_base_targets(nodes, facts):
+            continue
+        if resolve_singleton_base_targets(nodes, range_facts):
             continue
         summaries = summarize_subroutines(nodes, edges)
         edges = _add_interprocedural_return_edges(nodes, edges, summaries)
