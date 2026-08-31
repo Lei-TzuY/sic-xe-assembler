@@ -2,9 +2,10 @@ from control_flow_core import *
 from control_flow_core import analyze_control_flow as _analyze_control_flow_core
 from control_flow_core import annotate_typed_disassembly as _annotate_typed_disassembly_core
 from control_flow_core import render_control_flow_report as _render_control_flow_report_core
+from cross_domain_analysis import refine_cross_domain
 from function_analysis import analyze_functions
 from liveness_analysis import analyze_liveness
-from memory_analysis import analyze_memory_dataflow, enrich_function_memory_contracts
+from memory_interprocedural import analyze_memory_dataflow, enrich_function_memory_contracts
 from reaching_definitions import analyze_reaching_definitions, enrich_function_contracts
 
 
@@ -69,6 +70,7 @@ def _enrich_control_flow(report):
         node["unknown_memory_read"] = bool(facts.get("unknown_memory_read"))
         node["unknown_memory_write"] = bool(facts.get("unknown_memory_write"))
         node["memory_barrier"] = bool(facts.get("memory_barrier"))
+        node["memory_call_effect"] = facts.get("memory_call_effect")
         node["reaching_memory_in"] = dict(facts.get("reaching_memory_in") or {})
         node["reaching_memory_out"] = dict(facts.get("reaching_memory_out") or {})
 
@@ -97,6 +99,8 @@ def _enrich_control_flow(report):
             if call.get("resolved")
             else None
         )
+        source = next((node for node in nodes if node["address"] == call.get("source")), None)
+        call["memory_effect"] = None if source is None else source.get("memory_call_effect")
 
     dead_writes = [
         {
@@ -118,6 +122,8 @@ def _enrich_control_flow(report):
     report["unresolved_memory_reads"] = list(memory.get("unresolved_reads") or ())
     report["overwritten_stores"] = list(memory.get("overwritten_stores") or ())
     report["same_value_store_candidates"] = list(memory.get("same_value_store_candidates") or ())
+    report["memory_subroutines"] = list(memory.get("subroutine_effects") or ())
+    report.pop("cross_domain_memory_preview", None)
     metrics = report.setdefault("metrics", {})
     metrics["functions"] = len(functions)
     metrics["dead_register_writes"] = sum(
@@ -139,11 +145,14 @@ def _enrich_control_flow(report):
     )
     metrics["overwritten_stores"] = len(report["overwritten_stores"])
     metrics["same_value_store_candidates"] = len(report["same_value_store_candidates"])
+    metrics["memory_subroutines"] = len(report["memory_subroutines"])
+    metrics["memory_feedback_instructions"] = report.get("memory_feedback_instruction_count", 0)
+    metrics["cross_domain_iterations"] = report.get("cross_domain_iterations", 0)
     return report
 
 
 def analyze_control_flow(image, image_start, debug_map, entry_address, base_register=None):
-    """Build the historical CFG and enrich it with compiler-style analyses."""
+    """Build and cross-refine the typed CFG, then attach compiler-style analyses."""
     report = _analyze_control_flow_core(
         image,
         image_start,
@@ -151,6 +160,7 @@ def analyze_control_flow(image, image_start, debug_map, entry_address, base_regi
         entry_address,
         base_register=base_register,
     )
+    report = refine_cross_domain(report, base_register=base_register)
     return _enrich_control_flow(report)
 
 
@@ -207,6 +217,10 @@ def render_control_flow_report(report):
         lines.append("  -")
 
     lines.extend(["", "MEMORY DATAFLOW"])
+    lines.append(
+        f"  fixed-point iterations={report.get('cross_domain_iterations', 0)} "
+        f"feedback-instructions={report.get('memory_feedback_instruction_count', 0)}"
+    )
     any_memory = False
     for node in report.get("instructions", ()):
         read_cell = node.get("memory_cell_read")
@@ -227,6 +241,13 @@ def render_control_flow_report(report):
             )
             if node.get("stored_constant") is not None:
                 parts.append(f"stored={_format_optional_constant(node['stored_constant'])}")
+        if node.get("memory_feedback"):
+            parts.append("feedback=" + node["memory_feedback"])
+        call_effect = node.get("memory_call_effect")
+        if call_effect is not None:
+            parts.append(
+                "call-write=" + ("*" if call_effect.get("unknown_write") else ",".join(call_effect.get("may_write_cells") or ()) or "-")
+            )
         if node.get("memory_barrier"):
             parts.append("barrier")
         if node.get("unknown_memory_read"):
@@ -315,6 +336,8 @@ def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
                 )
                 if node.get("memory_constant") is not None:
                     additions.append(f"mem_const={node['memory_constant']:06X}")
+            if node.get("memory_feedback"):
+                additions.append("mem_feedback=" + node["memory_feedback"])
             if node.get("store_definition_id"):
                 additions.append("mem_def=" + node["store_definition_id"])
             if node.get("functions"):
