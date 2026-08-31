@@ -93,7 +93,7 @@ class MemoryDataflowTests(unittest.TestCase):
         self.assertEqual(load["load_from_stores"], expected)
         self.assertIsNone(load["memory_constant"])
 
-    def test_call_weak_clobber_preserves_old_store_as_possible_but_loses_constant_certainty(self):
+    def test_memory_free_call_preserves_precise_store_and_constant(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
             "ENTRY LDA #5\n"
@@ -107,10 +107,13 @@ class MemoryDataflowTests(unittest.TestCase):
             "      END ENTRY\n"
         )
         store = next(node for node in report["instructions"] if node["base_mnemonic"] == "STA")
+        call = next(node for node in report["instructions"] if node["base_mnemonic"] == "JSUB")
         load = next(node for node in report["instructions"] if node["base_mnemonic"] == "LDB")
-        self.assertIn(store["store_definition_id"], load["memory_sources"])
-        self.assertTrue(any(definition.startswith("MC") for definition in load["memory_sources"]))
-        self.assertIsNone(load["memory_constant"])
+        self.assertEqual(call["memory_call_effect"]["may_write_cells"], [])
+        self.assertFalse(call["memory_call_effect"]["unknown_write"])
+        self.assertEqual(load["memory_sources"], [store["store_definition_id"]])
+        self.assertEqual(load["memory_constant"], 5)
+        self.assertFalse(any(definition.startswith("MC") for definition in load["memory_sources"]))
         self.assertFalse(any(
             item["definition_id"] == store["store_definition_id"]
             for item in report["overwritten_stores"]
