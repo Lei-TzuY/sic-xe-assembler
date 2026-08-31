@@ -368,29 +368,34 @@ def derive_return_postconditions(value_analysis):
 
 
 def _attach_value_facts(nodes, value_analysis):
+    """Publish must-value facts and explicitly revoke facts that widened away."""
     for node in nodes:
         facts = value_analysis["instruction_facts"].get(node["address"], {})
         if facts.get("memory_read") is None:
             node.pop("memory_value_resolution", None)
             continue
+
         constant = facts.get("constant")
         raw_range = facts.get("range")
-        if constant is not None:
-            node["memory_constant"] = constant
-        if raw_range is not None:
-            node["memory_range"] = list(raw_range)
+        node["memory_constant"] = constant
+        node["memory_range"] = None if raw_range is None else list(raw_range)
         node["memory_value_resolution"] = facts.get("origin") or "abstract-memory-value"
+
         destination = LOAD_DESTINATION_REGISTERS.get(node["base_mnemonic"])
-        if destination is not None and constant is not None:
-            node["loaded_register_constant"] = {
-                "register": destination,
-                "value": constant & REGISTER_MASK,
-            }
-        if destination is not None and raw_range is not None:
-            node["loaded_register_range"] = {
-                "register": destination,
-                "range": list(raw_range),
-            }
+        if destination is None:
+            node["loaded_register_constant"] = None
+            node["loaded_register_range"] = None
+            continue
+        node["loaded_register_constant"] = (
+            None
+            if constant is None
+            else {"register": destination, "value": constant & REGISTER_MASK}
+        )
+        node["loaded_register_range"] = (
+            None
+            if raw_range is None
+            else {"register": destination, "range": list(raw_range)}
+        )
 
 
 def _clear_memory_base_resolution(node):
@@ -575,11 +580,13 @@ def refine_initialized_memory_postconditions(
         signature = _signature(nodes, edges, summaries, value_analysis)
         if signature == previous:
             exact_resolutions = sum(
-                1 for node in nodes
+                1
+                for node in nodes
                 if node.get("target_resolution") == "memory-feedback-base"
             )
             range_resolutions = sum(
-                1 for node in nodes
+                1
+                for node in nodes
                 if node.get("target_resolution") == "memory-feedback-range-base"
             )
             return {
