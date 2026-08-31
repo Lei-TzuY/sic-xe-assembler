@@ -8,4 +8,5 @@
 - `memory-dataflow.md` — alias-aware reaching stores, store-to-load chains, memory constants, overwritten-store evidence, and function memory contracts.
 - `memory-feedback.md` — integrated memory→register/range/CC fixed point, structural reanalysis after branch pruning, and compositional callee memory-effect summaries.
 - `memory-postconditions.md` — typed linked-image initializer seeding, callee return constants/ranges, and memory-derived B target resolution.
+- `register-postconditions.md` — caller-independent register/CC return constants and ranges, nested composition, link-register gating, caller branch pruning, and returned-B target recovery.
 - `analysis-contract.md` — trust boundary and fail-conservative guarantees.
