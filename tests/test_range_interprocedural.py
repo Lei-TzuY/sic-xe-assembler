@@ -126,7 +126,7 @@ class RangeInterproceduralTests(unittest.TestCase):
             "     RMO A,B\n"
             "     BASE 0\n"
             "     J FAR\n"
-            "VALUE WORD 123\n"
+            "VALUE RESW 1\n"
             "     RESB 3000\n"
             "FAR  RSUB\n"
             "     END MAIN\n"
