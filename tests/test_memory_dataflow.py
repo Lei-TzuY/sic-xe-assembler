@@ -155,6 +155,24 @@ class MemoryDataflowTests(unittest.TestCase):
         self.assertNotIn(second["store_definition_id"], overwritten_ids)
         self.assertEqual(report["metrics"]["overwritten_stores"], 1)
 
+    def test_same_value_store_is_only_a_candidate_and_keeps_precise_chain(self):
+        _, report = self.assemble_and_link(
+            "MAIN START 0\n"
+            "ENTRY LDA #3\n"
+            "FIRST STA SLOT\n"
+            "SECOND STA SLOT\n"
+            "      LDB SLOT\n"
+            "      RSUB\n"
+            "SLOT  RESW 1\n"
+            "      END ENTRY\n"
+        )
+        second = next(node for node in report["instructions"] if "SECOND" in node["symbols"])
+        candidates = report["same_value_store_candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["definition_id"], second["store_definition_id"])
+        self.assertEqual(candidates[0]["constant"], 3)
+        self.assertEqual(report["metrics"]["same_value_store_candidates"], 1)
+
     def test_function_memory_contracts_and_text_report(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
