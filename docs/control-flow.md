@@ -1,278 +1,183 @@
-# Control-flow, static dataflow, and graph analysis
+# Control-flow, abstract values, and interprocedural analysis
 
-The toolchain builds a conservative control-flow graph (CFG) from linked images when typed debug metadata is available, then enriches it with must-constant register and condition-code propagation, condition-sensitive branch pruning, conservative subroutine summaries, dominators, natural loops, call sites, and structural complexity metrics.
+The toolchain builds a conservative typed control-flow graph (CFG) from linked images, then layers exact constants, signed 24-bit intervals, condition reasoning, runtime base recovery, compositional subroutine summaries, proven return edges, dominators, loops, call metadata, and structural metrics on top.
 
 ```text
 python sicxe.py cfg program.bin --manifest program.manifest.json
 python sicxe.py cfg program.bin --manifest program.manifest.json --json
 python sicxe.py cfg program.bin --manifest program.manifest.json --dot
-```
-
-The same analysis can annotate source-aware disassembly:
-
-```text
 python sicxe.py disasm program.bin --manifest program.manifest.json --cfg
 ```
 
-## Inputs and trust boundary
-
-CFG analysis requires:
-
-- the linked `.bin` image;
-- its `.manifest.json`, which supplies LINKID, image origin, and the actual execution entry point;
-- a LINKID-matching `.debug.json`, normally auto-detected beside the image.
-
-Only regions explicitly typed as `instruction` are nodes. `WORD`, `BYTE`, literals, reservations, and untyped third-party CSECT bytes are never promoted to code merely because their bytes happen to decode as opcodes.
+Only `.debug.json` regions explicitly typed as instructions become CFG nodes. Data, literals, reservations, and untyped third-party bytes are never promoted to code merely because they decode as opcodes.
 
 ## Control-transfer model
 
-The analyzer recognizes:
+The structural graph recognizes direct `J`, `JEQ/JGT/JLT`, `JSUB`, `RSUB`, and ordinary same-CSECT fallthrough. Indirect (`@`) and indexed (`,X`) transfers remain unresolved rather than being guessed. Fallthrough never crosses a control-section boundary.
 
-- `J` / `+J` — unconditional jump, no fallthrough;
-- `JEQ`, `JGT`, `JLT` — conditional branch plus fallthrough unless condition analysis proves one edge impossible;
-- `JSUB` / `+JSUB` — call edge plus possible return continuation;
-- `RSUB` — dynamic return terminator;
-- ordinary instructions — fallthrough to the immediately adjacent typed instruction in the same CSECT.
+`RSUB` always retains its hardware-level unresolved `dynamic-return` edge. Later interprocedural analysis may add additional context-specific resolved return edges without deleting that dynamic truth.
 
-A direct target is resolved only when it lands exactly on another typed instruction region. Fallthrough never crosses a control-section boundary.
+## Exact must-constant domain
 
-Indirect (`@`) and indexed (`,X`) control transfers are intentionally not fabricated as static edges.
-
-## Must-constant register and condition dataflow
-
-The analysis tracks provable 24-bit constants for:
+The exact domain tracks 24-bit constants for:
 
 ```text
 A X L B S T
 ```
 
-and an abstract SIC/XE condition code:
+plus condition code:
 
 ```text
 LT EQ GT unknown
 ```
 
-The lattice is deliberately strict: at a merge, a register or condition remains known only when **every reachable predecessor proves the same value**. A conflicting value or any unknown predecessor makes the merged value unknown.
+A value survives a merge only when every reachable predecessor proves the same value. Supported transfer facts include immediate loads, `CLEAR`, `RMO`, selected register arithmetic, selected immediate accumulator arithmetic, `TIX/TIXR`, and `JSUB` setting L to the continuation address. Memory-dependent or unsupported writes degrade to unknown.
 
-Supported register transfer facts include:
+`COMP`, `COMPR`, `TIX`, and `TIXR` can prove CC when their operands are provable. Impossible `JEQ/JLT/JGT` branch or fallthrough edges are then marked `condition-false` with `abstract-condition` provenance.
 
-- immediate `LDA/LDB/LDL/LDS/LDT/LDX`;
-- `CLEAR`;
-- `RMO`;
-- constant `ADDR/SUBR/MULR/DIVR`;
-- immediate `ADD/SUB/MUL/DIV/AND/OR` when A is already known;
-- `TIX/TIXR` increment of a known X;
-- `JSUB` setting L to the return address.
+## Signed 24-bit interval domain
 
-Condition-code facts are produced conservatively by:
-
-- immediate `COMP` when A and the immediate operand are known;
-- `COMPR` when both compared registers are known;
-- immediate `TIX` when the incremented X and immediate operand are known;
-- `TIXR` when incremented X and the compared register are known.
-
-The comparison uses 24-bit two's-complement ordering. Memory-dependent comparisons remain unknown. `TD` and floating compare state are treated as unknown rather than guessed.
-
-Memory-dependent loads and arithmetic become unknown. Shift operations are conservatively treated as clobbering their destination rather than baking an uncertain shift-semantics assumption into the analyzer. `SVC` and `LPS` invalidate the tracked abstract state.
-
-### Condition-sensitive branch pruning
-
-When a conditional branch receives a proven condition code, impossible edges are removed from the resolved graph:
-
-```asm
-     LDA  #5
-     COMP #5
-     JEQ  TAKEN
-DEAD LDA  #9
-TAKEN RSUB
-```
-
-The abstract state before `JEQ` proves `CC=EQ`. The branch edge remains feasible and the fallthrough edge is marked:
+The second domain keeps a conservative convex interval for each tracked register. It uses signed two's-complement bounds:
 
 ```text
-reason=condition-false
-resolution=abstract-condition
+-8388608 .. 8388607
 ```
 
-`DEAD` therefore becomes unreachable, and dominators/loops/complexity consume the pruned graph.
+The exact API remains unchanged: `registers_in/out` still contain either an exact raw 24-bit value or `None`. Interval information is exposed separately as `ranges_in/out`.
 
-The reverse case is handled too: if `CC=LT` or `CC=GT`, a `JEQ` branch itself is pruned while its fallthrough remains feasible.
+At a merge, two known ranges join by convex hull. For example two paths that establish `A=1` and `A=2` produce:
 
-No pruning occurs when the condition is unknown. A memory-based `COMP`, conflicting predecessor conditions, or any unsupported comparison leaves both conditional edges in the graph.
+```text
+exact A = unknown
+range A = [1,2]
+```
 
-## Conservative subroutine summaries
-
-Resolved `JSUB/+JSUB` targets receive a local may-write summary. Starting at the callee entry, the analyzer follows resolved non-call control flow until visible `RSUB` sites and records which tracked registers may be written.
-
-A register is listed as **preserved** only if no visited callee instruction may write it. Registers with any possible write are listed under `may_clobber`.
-
-For example, a subroutine containing only:
+That range can still prove:
 
 ```asm
-ROUTN LDA #1
-      RSUB
+COMP #10
+JLT  TARGET
 ```
 
-may clobber A but preserves X/L/B/S/T. A caller with a previously proven B value can therefore retain B across that call and continue resolving later base-relative control transfers.
+because every possible A value is less than 10. The fallthrough becomes `condition-false` with `abstract-range-condition` provenance even though no exact A constant exists.
 
-A subroutine that executes `CLEAR B` cannot preserve B, so the caller's post-return B fact becomes unknown.
+The interval CC may also be a proper subset such as `{LT,EQ}`. A later `JGT` can therefore be ruled out while `JEQ` cannot.
 
-Nested calls are deliberately treated as opaque by this local summary model: encountering a nested `JSUB` marks every tracked caller-visible register as potentially clobbered. This avoids inventing a calling convention or recursively assuming preservation that has not been proven.
+### Arithmetic safety
 
-Condition-code preservation is never claimed by these summaries; caller continuation receives unknown CC after a call.
+Intervals are propagated only when the result is representable as one sound signed 24-bit convex interval. If arithmetic may cross two's-complement wrap, the result becomes unknown instead of inventing a misleading range.
 
-The structured CFG JSON exposes each resolved call node's `call_summary`, including:
+This rule is intentionally strict. For example `[0x7FFFFF,0x7FFFFF] + 1` does not become `[-8388608,-8388608]` in the interval domain; it becomes unknown because the current domain does not model modular non-convex wrap sets.
 
-- callee entry address and symbols;
-- `preserved` registers;
-- `may_clobber` registers;
-- visible `RSUB` return sites;
-- visited instruction addresses;
-- whether a visible return was found.
+`AND #mask` can narrow an unknown A to `[0,mask]` when the mask does not set the sign bit. This allows useful facts to emerge even after a memory-dependent load.
 
-### Runtime B-register resolution
+## Runtime B recovery from either domain
 
-This dataflow closes a major gap in static SIC/XE disassembly: base-relative control transfers no longer require a global manually supplied B value when the program itself proves B.
-
-For example:
-
-```asm
-     +LDB #FAR
-     BASE FAR
-     J FAR
-     RESB 4096
-FAR  RSUB
-```
-
-The linked extended `LDB` proves the runtime B value. The analyzer then re-decodes the b-relative `J`, resolves its actual loaded target, rebuilds CFG edges, recomputes dataflow, and iterates until target resolution reaches a fixed point.
-
-A target resolved this way is marked:
+Exact B constants continue to resolve b-relative instructions with:
 
 ```text
 target-resolution=dataflow-base
 ```
 
-The assembler `BASE` directive itself is **not** treated as runtime register state; it only controls encoding. Static resolution depends on machine instructions that actually establish B, on a conservative post-call preservation summary, or on an explicit initial `--base` assumption.
+A singleton interval can now resolve the same target even when the exact lattice is unknown:
 
-If two paths establish different B values before a merge, B becomes unknown and the later b-relative target remains unresolved.
+```asm
+LDA VALUE      ; exact/range A unknown
+AND #0         ; exact A unknown, range A=[0,0]
+RMO A,B        ; exact B unknown, range B=[0,0]
+BASE MAIN
+J FAR
+```
 
-## Reachability
+The resulting target is marked:
 
-Reachability starts at the execution address recorded by the linked-image manifest, not merely at PROGADDR.
+```text
+target-resolution=range-singleton-base
+```
 
-The analyzer follows only resolved and condition-feasible static edges. Instructions outside that proven closure are marked `UNREACHABLE`.
+Only a singleton interval is usable as an address. A wider interval never uses its midpoint or endpoints as a guessed B value. Range-owned target resolutions are revoked if a later fixed-point iteration widens B.
 
-This is a conservative statement:
+The assembler `BASE` directive is never treated as runtime register state; it only explains the chosen encoding.
 
-> `UNREACHABLE` means "not reachable from the known entry through the statically provable edges represented by this analysis."
+## Compositional subroutine summaries
 
-It does **not** mean the CPU can never execute that address. Dynamic indirect/indexed jumps, computed returns, self-modifying code, or other runtime behavior may add edges that a static image cannot prove.
+Every resolved call target receives a may-write summary. The analyzer first records direct writes in the callee, then composes resolved nested-callee summaries to a monotone fixed point.
 
-## Basic blocks
+Each summary exposes:
 
-A new basic block begins at:
+- `direct_clobbers`;
+- transitive `may_clobber`;
+- `preserved` registers;
+- `nested_callees`;
+- unresolved nested call sites;
+- visible `RSUB` sites;
+- visited instruction addresses;
+- `may_return`;
+- `link_register_preserved`.
 
-- the typed execution entry;
-- a resolved jump/branch/call target;
-- the fallthrough continuation after a conditional branch or call;
-- the first typed instruction in each section;
-- any instruction following a control-transfer terminator;
-- any instruction separated from the previous typed instruction by a non-code gap.
+A nested `JSUB` directly writes only L. Its callee's proven clobbers are then added transitively. Thus an outer routine calling an inner routine that only modifies A can still prove B preserved instead of falling back to global clobber.
 
-Blocks receive deterministic IDs (`B000`, `B001`, ...), ordered by input, section, and loaded address.
+Unknown/unresolved calls remain fully opaque and may clobber every tracked register. Recursive call cycles converge because may-clobber sets only grow.
 
-Each block records predecessor/successor block IDs and its dominator set.
+CC preservation is never claimed across calls.
 
-## Dominators
+## Proven interprocedural return edges
 
-Dominators are computed over the condition-pruned resolved reachable block graph rooted at the manifest entry block. Call edges participate in this whole-program dominance relation.
+A resolved call has a known continuation because `JSUB` writes L to the address following the call. A callee summary can therefore prove a particular `RSUB` returns to that continuation when all of the following hold:
 
-For every reachable block `B`, the JSON report exposes the blocks that dominate `B`. The entry block dominates every reachable block in an ordinary single-entry graph.
+1. the call target is resolved typed code;
+2. the callee exposes an `RSUB` return site;
+3. no reachable callee instruction may write L;
+4. the caller continuation is a typed instruction.
 
-## Back edges and natural loops
+The graph then keeps the original unresolved edge:
 
-A resolved non-call edge `U -> H` is a back edge when `H` dominates `U`.
+```text
+RSUB --return--> ? [dynamic-return]
+```
 
-For each back edge, the analyzer constructs the corresponding natural loop by walking non-call predecessors backward from the latch to the header. The report includes:
+and adds a context-specific edge:
 
-- loop header block;
-- latch block;
-- member blocks;
-- the underlying back edge.
+```text
+RSUB --return--> CONT [resolved/link-register-summary]
+```
 
-Call edges are excluded from loop formation.
+Synthetic return edges contain `synthetic_return=true`, `call_source`, and `callee_entry` metadata. They participate in whole-program predecessor/successor and DOT output, but **do not feed context-free register/range propagation**. Caller continuation state is already propagated through the call summary, so mixing raw callee state into every caller would be unsound.
 
-## Call graph
+Synthetic returns are also excluded from intraprocedural natural-loop and McCabe calculations, just like call edges. A callee that writes L, performs a nested `JSUB`, or otherwise cannot prove the link register untouched does not receive a synthetic return edge.
 
-Every `JSUB/+JSUB` produces a call-site record containing:
+## Condition-sensitive fixed point
 
-- caller address/block/CSECT;
-- target address/block when statically resolved;
-- callee CSECT;
-- symbols beginning at the target;
-- unresolved reason when the target cannot be proved;
-- whether target recovery depended on dataflow-resolved B.
+Exact CC pruning, interval CC pruning, and base-target recovery are iterated until stable. Removing an impossible edge can tighten later joins; tighter joins can prove additional constants/ranges; those facts can in turn resolve more control targets.
 
-Return edges remain dynamic because `RSUB` obtains its destination from L; the analyzer does not invent a return target.
+The process is monotone and fail-conservative: unknown information stays unknown, and target/condition provenance records which domain supplied each proof.
 
-The separate local `call_summary` attached to the call instruction controls only which proven register constants can safely survive into the caller's synthetic return continuation.
+## Reachability and basic blocks
 
-## Structural metrics
+Reachability begins at the manifest's real execution entry. Only resolved feasible edges are followed. `UNREACHABLE` therefore means "not reachable through the statically provable graph represented by this analysis", not "physically impossible at runtime"; unresolved indirect jumps, self-modifying code, and other dynamic behavior can still add paths.
 
-The report exposes:
+Basic blocks use deterministic IDs (`B000`, `B001`, ...). Blocks record predecessors, successors, reachability, and dominators. Instruction-level sequential fallthrough inside one block is retained for dataflow but is not counted as a separate block-graph edge.
 
-- reachable basic-block count;
-- resolved intraprocedural edge count;
-- weak component count after excluding call edges;
-- decision-point count;
-- natural-loop count;
-- McCabe-style cyclomatic complexity.
+## Dominators, loops, calls, and complexity
 
-For reachable blocks, complexity is:
+Dominators operate over the resolved reachable whole-program graph. Natural-loop detection excludes call and synthetic-return edges. A non-call/non-synthetic-return edge `U -> H` is a back edge when H dominates U.
+
+Call records include target symbols, continuation address, callee summary, proven return sites, and whether interprocedural returns were resolved.
+
+McCabe-style complexity uses only reachable resolved intraprocedural block edges:
 
 ```text
 M = E - N + 2P
 ```
 
-where `E` is the number of resolved non-call block edges, `N` is reachable block count, and `P` is the number of weakly connected components in that non-call graph. Condition-proven impossible edges are excluded automatically. Excluding call edges avoids counting a subroutine invocation itself as a branch decision; disconnected caller/callee components contribute their own baseline complexity.
+Calls and synthetic returns are excluded so procedure linkage itself is not counted as a branch decision.
 
-## Edge model
+## Reports
 
-Instruction-level edges carry:
+Text output includes exact and range facts, edge proof provenance, subroutine summaries, calls, loops, and metrics. JSON retains all structures directly. DOT renders resolved block edges, including proven interprocedural returns.
 
-- source address;
-- optional target address;
-- kind (`fallthrough`, `branch`, `jump`, `call`, `return`);
-- whether the target resolves to typed code;
-- source/target basic-block IDs where available;
-- unresolved reason (`indirect`, `indexed`, `unresolved-addressing`, `outside-typed-code`, `dynamic-return`, or `condition-false`);
-- target-resolution provenance such as `dataflow-base` or `abstract-condition`;
-- proven condition metadata when branch feasibility is known.
-
-This structure, register/CC facts, call summaries, dominators, loops, calls, and metrics are all available through `--json`.
-
-## Graphviz output
-
-`--dot` emits deterministic Graphviz DOT with one node per basic block and resolved block-to-block edges:
-
-```text
-python sicxe.py cfg program.bin --manifest program.manifest.json --dot > program.dot
-```
-
-Loop-member blocks are annotated in their labels. Edges resolved from a proven B constant retain `dataflow-base` in the edge label. Condition-pruned edges are absent from the resolved block graph. The JSON report remains the complete machine-readable representation.
-
-## Provenance integration
-
-CFG instruction records inherit the same provenance as typed disassembly:
-
-- original source line;
-- outermost macro invocation line;
-- nested macro definition/body/call-site stack;
-- expanded-source line;
-- symbols at the instruction address.
-
-Source-aware disassembly with `--cfg` additionally prints proven incoming register constants and target-resolution annotations beside the machine instruction. Structured JSON retains the full condition-code state and call summaries.
+Source-aware `disasm --cfg` annotates exact incoming register constants, non-singleton incoming ranges, possible CC sets, reachability/basic-block identity, and base-target proof provenance beside each typed instruction.
 
 ## Scope
 
-This remains a static abstract interpretation, not an emulator or decompiler. It proves a narrow set of constant register/condition facts and structural edges; it does not model arbitrary memory contents, infer arbitrary indirect/indexed targets, assume a calling convention, recursively solve nested-call summaries, or synthesize dynamic RSUB return edges. Unknown information stays unknown rather than being guessed.
+This is a static abstract interpreter, not an emulator or decompiler. The interval domain is intentionally convex and signed-24-bit; it does not model arbitrary modular sets or memory contents. Return resolution is intentionally proof-based and context-limited; dynamic `RSUB` semantics are never erased. Unknown indirect/indexed targets, untyped bytes, opaque calls, and unsupported machine effects remain unknown rather than being guessed.
