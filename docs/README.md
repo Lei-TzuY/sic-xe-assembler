@@ -6,4 +6,5 @@
 - `liveness-functions.md` — register/CC liveness, dead-write evidence, function discovery, ownership, callers/callees, and per-function metrics.
 - `reaching-definitions.md` — GEN/KILL reaching definitions, def-use chains, entry pseudo-definitions, and function input/output contracts.
 - `memory-dataflow.md` — alias-aware reaching stores, store-to-load chains, memory constants, overwritten-store evidence, and function memory contracts.
+- `cross-domain-fixed-point.md` — memory-to-register/range feedback, CFG refinement, base-target recovery, and compositional callee memory effects.
 - `analysis-contract.md` — trust boundary and fail-conservative guarantees.
