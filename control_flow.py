@@ -4,6 +4,7 @@ from control_flow_core import annotate_typed_disassembly as _annotate_typed_disa
 from control_flow_core import render_control_flow_report as _render_control_flow_report_core
 from function_analysis import analyze_functions
 from liveness_analysis import analyze_liveness
+from reaching_definitions import analyze_reaching_definitions, enrich_function_contracts
 
 
 def _summary_map(report):
@@ -34,6 +35,21 @@ def _enrich_control_flow(report):
         node["side_effects"] = bool(facts.get("side_effects"))
         node["opaque_liveness"] = bool(facts.get("opaque"))
 
+    reaching = analyze_reaching_definitions(
+        nodes,
+        edges,
+        report.get("entry_address"),
+        summaries=summaries,
+        liveness=liveness,
+    )
+    for node in nodes:
+        facts = reaching.get("instruction_facts", {}).get(node["address"], {})
+        node["reaching_in"] = dict(facts.get("reaching_in") or {})
+        node["reaching_out"] = dict(facts.get("reaching_out") or {})
+        node["use_definitions"] = dict(facts.get("use_definitions") or {})
+        node["definition_ids"] = dict(facts.get("definition_ids") or {})
+        node["unresolved_uses"] = list(facts.get("unresolved_uses") or ())
+
     functions, ownership, entry_to_id = analyze_functions(
         nodes,
         edges,
@@ -42,6 +58,7 @@ def _enrich_control_flow(report):
         summaries,
         liveness,
     )
+    enrich_function_contracts(functions, reaching)
     for node in nodes:
         node["functions"] = list(ownership.get(node["address"], ()))
     for block in blocks:
@@ -68,6 +85,10 @@ def _enrich_control_flow(report):
     ]
     report["functions"] = functions
     report["dead_writes"] = dead_writes
+    report["definitions"] = list(reaching.get("definitions") or ())
+    report["def_use_chains"] = list(reaching.get("chains") or ())
+    report["unresolved_uses"] = list(reaching.get("unresolved_uses") or ())
+    report["dead_definitions"] = list(reaching.get("dead_definitions") or ())
     metrics = report.setdefault("metrics", {})
     metrics["functions"] = len(functions)
     metrics["dead_register_writes"] = sum(
@@ -75,11 +96,17 @@ def _enrich_control_flow(report):
         for item in dead_writes
     )
     metrics["instructions_with_dead_writes"] = len(dead_writes)
+    metrics["reaching_definitions"] = len(report["definitions"])
+    metrics["def_use_links"] = sum(
+        len(chain.get("use_sites") or ())
+        for chain in report["def_use_chains"]
+    )
+    metrics["unresolved_uses"] = len(report["unresolved_uses"])
     return report
 
 
 def analyze_control_flow(image, image_start, debug_map, entry_address, base_register=None):
-    """Build the historical CFG and enrich it with liveness/function analysis."""
+    """Build the historical CFG and enrich it with compiler-style analyses."""
     report = _analyze_control_flow_core(
         image,
         image_start,
@@ -118,6 +145,26 @@ def render_control_flow_report(report):
     if not any_liveness:
         lines.append("  -")
 
+    lines.extend(["", "REACHING DEFINITIONS"])
+    any_chains = False
+    for node in report.get("instructions", ()):
+        use_defs = node.get("use_definitions") or {}
+        definition_ids = node.get("definition_ids") or {}
+        if not use_defs and not definition_ids:
+            continue
+        any_chains = True
+        uses = ";".join(
+            f"{value}<-{','.join(definitions) or '?'}"
+            for value, definitions in sorted(use_defs.items())
+        ) or "-"
+        defs = ",".join(
+            f"{value}={definition_id}"
+            for value, definition_id in sorted(definition_ids.items())
+        ) or "-"
+        lines.append(f"  {node['address']:05X} uses={uses} defs={defs}")
+    if not any_chains:
+        lines.append("  -")
+
     lines.extend(["", "FUNCTIONS"])
     if report.get("functions"):
         for function in report["functions"]:
@@ -128,6 +175,10 @@ def render_control_flow_report(report):
                 f"blocks={','.join(function.get('blocks') or ()) or '-'} "
                 f"callers={','.join(function.get('callers') or ()) or '-'} "
                 f"callees={','.join(function.get('callees') or ()) or '-'} "
+                f"required={','.join(function.get('required_inputs') or ()) or '-'} "
+                f"outputs={','.join(function.get('produced_outputs') or ()) or '-'} "
+                f"passthrough={','.join(function.get('passthrough_inputs') or ()) or '-'} "
+                f"overwritten={','.join(function.get('overwritten_inputs') or ()) or '-'} "
                 f"preserved={','.join(function.get('preserved') or ()) or '-'} "
                 f"clobber={','.join(function.get('may_clobber') or ()) or '-'} "
                 f"complexity={metrics.get('cyclomatic_complexity', 0)}"
@@ -163,6 +214,13 @@ def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
                 additions.append("live_in=" + ",".join(node["live_in"]))
             if node.get("dead_writes"):
                 additions.append("dead_writes=" + ",".join(node["dead_writes"]))
+            if node.get("use_definitions"):
+                additions.append(
+                    "use_defs=" + ";".join(
+                        f"{value}<-{','.join(definitions) or '?'}"
+                        for value, definitions in sorted(node["use_definitions"].items())
+                    )
+                )
             if node.get("functions"):
                 additions.append("functions=" + ",".join(node["functions"]))
         if additions:
