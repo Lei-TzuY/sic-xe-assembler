@@ -117,6 +117,32 @@ class RangeInterproceduralTests(unittest.TestCase):
         bad = next(node for node in report["instructions"] if "BAD" in node["symbols"])
         self.assertFalse(bad["reachable"])
 
+    def test_singleton_interval_can_resolve_base_target_without_exact_b(self):
+        _, report = self.assemble_and_link(
+            "MAIN START 0\n"
+            "     LDA VALUE\n"
+            "     AND #0\n"
+            "     RMO A,B\n"
+            "     BASE MAIN\n"
+            "     J FAR\n"
+            "VALUE WORD 123\n"
+            "     RESB 3000\n"
+            "FAR  RSUB\n"
+            "     END MAIN\n"
+        )
+        jump = next(node for node in report["instructions"] if node["base_mnemonic"] == "J")
+        self.assertIsNone(jump["registers_in"]["B"])
+        self.assertEqual(jump["ranges_in"]["B"], (0, 0))
+        self.assertEqual(jump["target_resolution"], "range-singleton-base")
+        far = next(node for node in report["instructions"] if "FAR" in node["symbols"])
+        self.assertEqual(jump["target"], far["address"])
+        edge = next(
+            edge for edge in report["edges"]
+            if edge["source"] == jump["address"] and edge["kind"] == "jump"
+        )
+        self.assertTrue(edge["resolved"])
+        self.assertEqual(edge["resolution"], "range-singleton-base")
+
     def test_nested_callee_summaries_compose_without_global_clobber(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
