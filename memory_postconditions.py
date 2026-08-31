@@ -2,7 +2,6 @@ import control_flow_core as _core
 from disassembler import decode_instruction
 from memory_analysis import LOAD_DESTINATION_REGISTERS, STORE_SOURCE_REGISTERS, WORD_BYTES, _cell_id, _ranges_overlap
 from memory_feedback import (
-    _memory_operation,
     _tracked_cells,
     analyze_memory_aware_constants,
     analyze_memory_aware_ranges,
@@ -12,6 +11,8 @@ from static_analysis import REGISTER_MASK, summarize_subroutines
 
 
 INITIALIZED_REGION_KINDS = {"word", "byte", "literal"}
+MEMORY_BASE_RESOLUTIONS = {"memory-feedback-base", "memory-feedback-range-base"}
+CORE_BASE_RESOLUTIONS = {"dataflow-base", "range-singleton-base"}
 
 
 class MemoryPostconditionError(ValueError):
@@ -76,22 +77,19 @@ def _copy_state(state, cells):
 
 
 def _state_equal(left, right, cells):
-    return all(_value_equal(left.get(cell, _unknown_value()), right.get(cell, _unknown_value())) for cell in cells)
+    return all(
+        _value_equal(
+            left.get(cell, _unknown_value()),
+            right.get(cell, _unknown_value()),
+        )
+        for cell in cells
+    )
 
 
 def _join_state(left, right, cells):
     if left is None:
         return _copy_state(right, cells)
     return {cell: _join_value(left.get(cell), right.get(cell)) for cell in cells}
-
-
-def _section_for_address(debug_map, address):
-    for section in debug_map.get("sections", ()):
-        start = section.get("load_address")
-        length = section.get("length")
-        if isinstance(start, int) and isinstance(length, int) and start <= address < start + length:
-            return section
-    return None
 
 
 def _covering_initialized_region(debug_map, cell):
@@ -212,12 +210,6 @@ def _summary_by_entry(structural, hints):
     return result
 
 
-def _call_summary(node, summaries):
-    if node["base_mnemonic"] != "JSUB":
-        return None
-    return summaries.get(node.get("target"))
-
-
 def _apply_call_value_effect(outgoing, summary, cells, cells_by_id):
     result = _copy_state(outgoing, cells)
     if summary is None or summary.get("unknown_write"):
@@ -248,9 +240,13 @@ def _apply_call_value_effect(outgoing, summary, cells, cells_by_id):
 
 def _transfer_value(node, incoming, cells, operation, summaries, cells_by_id):
     outgoing = _copy_state(incoming, cells)
-    summary = _call_summary(node, summaries)
     if node["base_mnemonic"] == "JSUB":
-        return _apply_call_value_effect(outgoing, summary, cells, cells_by_id)
+        return _apply_call_value_effect(
+            outgoing,
+            summaries.get(node.get("target")),
+            cells,
+            cells_by_id,
+        )
     if operation.get("unknown_write") or operation.get("barrier"):
         outgoing = _empty_state(cells)
     write = operation.get("write")
@@ -296,7 +292,12 @@ def analyze_memory_values(nodes, edges, entry_address, seeds, summary_hints=None
             if candidate is None:
                 continue
             state_out = _transfer_value(
-                by_address[address], candidate, cells, operations[address], summaries, cells_by_id
+                by_address[address],
+                candidate,
+                cells,
+                operations[address],
+                summaries,
+                cells_by_id,
             )
             if incoming[address] is None or not _state_equal(incoming[address], candidate, cells):
                 incoming[address] = candidate
@@ -339,11 +340,18 @@ def derive_return_postconditions(value_analysis):
         ranges = {}
         if returns:
             for cell in cells:
-                values = [outgoing.get(site, {}).get(cell) for site in returns]
+                values = [
+                    (outgoing.get(site) or {}).get(cell)
+                    for site in returns
+                ]
                 if any(value is None for value in values):
                     continue
                 exact_values = [value.get("constant") for value in values]
-                if exact_values and exact_values[0] is not None and all(value == exact_values[0] for value in exact_values):
+                if (
+                    exact_values
+                    and exact_values[0] is not None
+                    and all(value == exact_values[0] for value in exact_values)
+                ):
                     constants[_cell_id(cell)] = exact_values[0]
                 intervals = [value.get("range") for value in values]
                 if intervals and all(interval is not None for interval in intervals):
@@ -385,13 +393,33 @@ def _attach_value_facts(nodes, value_analysis):
             }
 
 
+def _clear_memory_base_resolution(node):
+    decoded = decode_instruction(
+        bytes.fromhex(node["bytes"]),
+        address=node["address"],
+        base_register=None,
+    )
+    changed = (
+        node.get("operand") != decoded.operand
+        or node.get("target") != decoded.target
+        or node.get("target_resolution") in MEMORY_BASE_RESOLUTIONS
+        or "base_value" in node
+    )
+    node["operand"] = decoded.operand
+    node["target"] = decoded.target
+    node["warning"] = decoded.warning
+    node.pop("base_value", None)
+    node.pop("target_resolution", None)
+    return changed
+
+
 def _resolve_memory_base_targets(nodes, exact_facts, range_facts):
     changed = False
-    exact_count = 0
-    range_count = 0
     for node in nodes:
         flags = node.get("flags") or ""
         if len(flags) != 6 or flags[3] != "1" or flags[4] != "0" or flags[5] != "0":
+            continue
+        if node.get("target_resolution") in CORE_BASE_RESOLUTIONS:
             continue
         exact_in = (exact_facts.get(node["address"]) or {}).get("in")
         range_in = (range_facts.get(node["address"]) or {}).get("in")
@@ -399,14 +427,14 @@ def _resolve_memory_base_targets(nodes, exact_facts, range_facts):
         resolution = None
         if base_value is not None:
             resolution = "memory-feedback-base"
-            exact_count += 1
         elif range_in is not None:
             interval = range_in.get("B")
             if interval is not None and interval[0] == interval[1]:
                 base_value = interval[0] & REGISTER_MASK
                 resolution = "memory-feedback-range-base"
-                range_count += 1
         if base_value is None:
+            if node.get("target_resolution") in MEMORY_BASE_RESOLUTIONS:
+                changed = _clear_memory_base_resolution(node) or changed
             continue
         decoded = decode_instruction(
             bytes.fromhex(node["bytes"]),
@@ -414,6 +442,8 @@ def _resolve_memory_base_targets(nodes, exact_facts, range_facts):
             base_register=base_value,
         )
         if decoded.target is None:
+            if node.get("target_resolution") in MEMORY_BASE_RESOLUTIONS:
+                changed = _clear_memory_base_resolution(node) or changed
             continue
         if (
             node.get("operand") != decoded.operand
@@ -427,7 +457,7 @@ def _resolve_memory_base_targets(nodes, exact_facts, range_facts):
             node["base_value"] = base_value
             node["target_resolution"] = resolution
             changed = True
-    return changed, exact_count, range_count
+    return changed
 
 
 def _rebuild_edges(nodes):
@@ -448,6 +478,7 @@ def _signature(nodes, edges, summaries, value_analysis):
                 repr(node.get("ranges_out")),
                 node.get("memory_constant"),
                 repr(node.get("memory_range")),
+                node.get("memory_value_resolution"),
                 node.get("target"),
                 node.get("target_resolution"),
             )
@@ -455,8 +486,12 @@ def _signature(nodes, edges, summaries, value_analysis):
         ),
         tuple(
             (
-                edge.get("source"), edge.get("target"), edge.get("kind"),
-                bool(edge.get("resolved")), edge.get("resolution"), edge.get("reason"),
+                edge.get("source"),
+                edge.get("target"),
+                edge.get("kind"),
+                bool(edge.get("resolved")),
+                edge.get("resolution"),
+                edge.get("reason"),
             )
             for edge in edges
         ),
@@ -464,7 +499,12 @@ def _signature(nodes, edges, summaries, value_analysis):
             (
                 entry,
                 tuple(sorted(summary.get("return_constants", {}).items())),
-                tuple(sorted((key, tuple(value)) for key, value in summary.get("return_ranges", {}).items())),
+                tuple(
+                    sorted(
+                        (key, tuple(value))
+                        for key, value in summary.get("return_ranges", {}).items()
+                    )
+                ),
             )
             for entry, summary in sorted(summaries.items())
         ),
@@ -494,10 +534,6 @@ def refine_initialized_memory_postconditions(
     summary_hints = {}
     previous = None
     max_iterations = max(5, len(nodes) + 5)
-    exact_resolutions = 0
-    range_resolutions = 0
-    last_value_analysis = None
-    last_seeds = {}
 
     for iteration in range(1, max_iterations + 1):
         cells, _ = _tracked_cells(nodes)
@@ -530,35 +566,38 @@ def refine_initialized_memory_postconditions(
             node["ranges_in"] = ranges[node["address"]]["in"]
             node["ranges_out"] = ranges[node["address"]]["out"]
 
-        targets_changed, exact_count, range_count = _resolve_memory_base_targets(nodes, exact, ranges)
-        exact_resolutions = max(exact_resolutions, exact_count)
-        range_resolutions = max(range_resolutions, range_count)
-        if targets_changed:
+        if _resolve_memory_base_targets(nodes, exact, ranges):
             edges[:] = _rebuild_edges(nodes)
             summary_hints = summaries
-            last_value_analysis = value_analysis
-            last_seeds = seeds
             previous = None
             continue
 
         signature = _signature(nodes, edges, summaries, value_analysis)
         if signature == previous:
+            exact_resolutions = sum(
+                1 for node in nodes
+                if node.get("target_resolution") == "memory-feedback-base"
+            )
+            range_resolutions = sum(
+                1 for node in nodes
+                if node.get("target_resolution") == "memory-feedback-range-base"
+            )
             return {
                 "iterations": iteration,
                 "converged": True,
-                "seeds": [last_seeds[cell] for cell in sorted(last_seeds)],
-                "summaries": [summary_hints[key] for key in sorted(summary_hints)],
-                "summary_map": summary_hints,
-                "value_analysis": last_value_analysis,
+                "seeds": [seeds[cell] for cell in sorted(seeds)],
+                "summaries": [summaries[key] for key in sorted(summaries)],
+                "summary_map": summaries,
+                "value_analysis": value_analysis,
                 "memory_base_resolutions": exact_resolutions,
                 "memory_range_base_resolutions": range_resolutions,
             }
         previous = signature
         summary_hints = summaries
-        last_value_analysis = value_analysis
-        last_seeds = seeds
 
-    raise MemoryPostconditionError("Initialized-memory/postcondition analysis did not converge")
+    raise MemoryPostconditionError(
+        "Initialized-memory/postcondition analysis did not converge"
+    )
 
 
 def attach_final_value_facts(nodes, refinement):
