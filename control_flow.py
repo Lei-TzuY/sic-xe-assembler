@@ -16,6 +16,7 @@ from memory_postconditions import (
     refine_initialized_memory_postconditions,
 )
 from reaching_definitions import analyze_reaching_definitions, enrich_function_contracts
+from register_postconditions import refine_register_postconditions
 from static_analysis import summarize_subroutines
 
 
@@ -95,6 +96,17 @@ def _enrich_control_flow(
         base_register=base_register,
     )
 
+    # Finally infer caller-independent register return contracts from unknown
+    # function-entry state and feed them back through the richer memory-aware
+    # caller analysis. This can prove post-call comparisons/branches and B-based
+    # targets without making callee summaries depend on one caller's memory.
+    register_refinement = refine_register_postconditions(
+        nodes,
+        edges,
+        report.get("entry_address"),
+        base_register=base_register,
+    )
+
     _rebuild_structure(report)
     edges = report.get("edges", [])
     blocks = report.get("blocks", [])
@@ -150,8 +162,10 @@ def _enrich_control_flow(
     enrich_function_memory_contracts(functions, memory)
 
     value_summary_by_entry = dict(value_refinement.get("summary_map") or {})
+    register_summary_by_entry = dict(register_refinement.get("summary_map") or {})
     for function in functions:
         function["memory_effect_summary"] = value_summary_by_entry.get(function["entry"])
+        function["register_return_summary"] = register_summary_by_entry.get(function["entry"])
     for node in nodes:
         node["functions"] = list(ownership.get(node["address"], ()))
     for block in blocks:
@@ -168,6 +182,7 @@ def _enrich_control_flow(
             else None
         )
         call["memory_effect_summary"] = value_summary_by_entry.get(call.get("target"))
+        call["register_return_summary"] = register_summary_by_entry.get(call.get("target"))
 
     dead_writes = [
         {
@@ -191,6 +206,7 @@ def _enrich_control_flow(
     report["same_value_store_candidates"] = list(memory.get("same_value_store_candidates") or ())
     report["memory_effect_summaries"] = list(value_refinement.get("summaries") or ())
     report["initialized_memory"] = list(value_refinement.get("seeds") or ())
+    report["register_return_summaries"] = list(register_refinement.get("summaries") or ())
     report["memory_feedback"] = {
         "iterations": feedback_memory.get("feedback_iterations"),
         "converged": bool(feedback_memory.get("feedback_converged")),
@@ -199,6 +215,12 @@ def _enrich_control_flow(
         "initialized_cells": len(report["initialized_memory"]),
         "memory_base_resolutions": value_refinement.get("memory_base_resolutions", 0),
         "memory_range_base_resolutions": value_refinement.get("memory_range_base_resolutions", 0),
+    }
+    report["register_postconditions"] = {
+        "iterations": register_refinement.get("iterations"),
+        "converged": bool(register_refinement.get("converged")),
+        "base_resolutions": register_refinement.get("base_resolutions", 0),
+        "range_base_resolutions": register_refinement.get("range_base_resolutions", 0),
     }
 
     metrics = report.setdefault("metrics", {})
@@ -232,12 +254,28 @@ def _enrich_control_flow(
         len(summary.get("return_value_cells") or ())
         for summary in report["memory_effect_summaries"]
     )
+    metrics["register_postcondition_iterations"] = register_refinement.get("iterations", 0)
+    metrics["return_register_postconditions"] = sum(
+        len(summary.get("return_value_registers") or ())
+        for summary in report["register_return_summaries"]
+    )
+    metrics["register_postcondition_base_resolutions"] = register_refinement.get("base_resolutions", 0)
+    metrics["register_postcondition_range_base_resolutions"] = register_refinement.get("range_base_resolutions", 0)
     metrics["memory_feedback_pruned_edges"] = sum(
         1
         for edge in edges
         if edge.get("resolution") in (
             "memory-feedback-condition",
             "memory-feedback-range-condition",
+        )
+        and not edge.get("resolved")
+    )
+    metrics["register_postcondition_pruned_edges"] = sum(
+        1
+        for edge in edges
+        if edge.get("resolution") in (
+            "register-postcondition-condition",
+            "register-postcondition-range-condition",
         )
         and not edge.get("resolved")
     )
@@ -279,20 +317,21 @@ def _format_optional_range(value):
 
 def _format_summary_constants(summary):
     values = summary.get("return_constants") or {}
-    return ",".join(f"{cell}={value:06X}" for cell, value in sorted(values.items())) or "-"
+    return ",".join(f"{name}={value:06X}" for name, value in sorted(values.items())) or "-"
 
 
 def _format_summary_ranges(summary):
     values = summary.get("return_ranges") or {}
     return ",".join(
-        f"{cell}={_format_optional_range(interval)}"
-        for cell, interval in sorted(values.items())
+        f"{name}={_format_optional_range(interval)}"
+        for name, interval in sorted(values.items())
     ) or "-"
 
 
 def render_control_flow_report(report):
     base = _render_control_flow_report_core(report).rstrip("\n")
     feedback = report.get("memory_feedback") or {}
+    register_feedback = report.get("register_postconditions") or {}
     lines = [
         base,
         "",
@@ -306,6 +345,14 @@ def render_control_flow_report(report):
             f"base-resolved={feedback.get('memory_base_resolutions', 0)} "
             f"range-base-resolved={feedback.get('memory_range_base_resolutions', 0)} "
             f"pruned={report.get('metrics', {}).get('memory_feedback_pruned_edges', 0)}"
+        ),
+        (
+            "REGISTER POSTCONDITIONS "
+            f"iterations={register_feedback.get('iterations', 0)} "
+            f"converged={str(bool(register_feedback.get('converged'))).lower()} "
+            f"base-resolved={register_feedback.get('base_resolutions', 0)} "
+            f"range-base-resolved={register_feedback.get('range_base_resolutions', 0)} "
+            f"pruned={report.get('metrics', {}).get('register_postcondition_pruned_edges', 0)}"
         ),
         "",
         "LIVENESS",
@@ -425,10 +472,24 @@ def render_control_flow_report(report):
                 f"    {item['address']:05X} {item['cell']} value={item['constant']:06X}"
             )
 
+    lines.extend(["", "REGISTER RETURN POSTCONDITIONS"])
+    if report.get("register_return_summaries"):
+        for summary in report["register_return_summaries"]:
+            lines.append(
+                f"  {summary['entry']:05X} "
+                f"return={_format_summary_constants(summary)} "
+                f"return-range={_format_summary_ranges(summary)} "
+                f"cc={','.join(summary.get('return_conditions') or ()) or '-'} "
+                f"link-preserved={str(bool(summary.get('link_register_preserved'))).lower()}"
+            )
+    else:
+        lines.append("  -")
+
     lines.extend(["", "FUNCTIONS"])
     if report.get("functions"):
         for function in report["functions"]:
             metrics = function.get("metrics", {})
+            register_summary = function.get("register_return_summary") or {}
             lines.append(
                 f"  {function['id']} entry={function['entry']:05X} "
                 f"symbols={','.join(function.get('symbols') or ()) or '-'} "
@@ -442,6 +503,8 @@ def render_control_flow_report(report):
                 f"mem-in={','.join(function.get('memory_inputs') or ()) or '-'} "
                 f"mem-out={','.join(function.get('memory_outputs') or ()) or '-'} "
                 f"mem-write={','.join(function.get('memory_writes') or ()) or '-'} "
+                f"ret={_format_summary_constants(register_summary)} "
+                f"ret-range={_format_summary_ranges(register_summary)} "
                 f"preserved={','.join(function.get('preserved') or ()) or '-'} "
                 f"clobber={','.join(function.get('may_clobber') or ()) or '-'} "
                 f"complexity={metrics.get('cyclomatic_complexity', 0)}"
@@ -496,6 +559,11 @@ def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
                     additions.append("mem_via=" + node["memory_value_resolution"])
             if node.get("store_definition_id"):
                 additions.append("mem_def=" + node["store_definition_id"])
+            if node.get("register_return_summary"):
+                summary = node["register_return_summary"]
+                additions.append("ret=" + _format_summary_constants(summary))
+                if summary.get("return_ranges"):
+                    additions.append("ret_range=" + _format_summary_ranges(summary))
             if node.get("functions"):
                 additions.append("functions=" + ",".join(node["functions"]))
         if additions:
