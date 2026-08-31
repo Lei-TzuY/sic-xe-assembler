@@ -138,7 +138,7 @@ class ConditionInterproceduralTests(unittest.TestCase):
         self.assertIsNotNone(jump["target"])
         self.assertEqual(jump["target_resolution"], "dataflow-base")
 
-    def test_callee_that_writes_base_prevents_post_call_resolution(self):
+    def test_callee_constant_base_write_replaces_pre_call_base(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
             "     +LDB #FAR\n"
@@ -152,8 +152,15 @@ class ConditionInterproceduralTests(unittest.TestCase):
             "     END MAIN\n"
         )
         jump = next(node for node in report["instructions"] if node["base_mnemonic"] == "J")
-        self.assertIsNone(jump["target"])
-        self.assertNotEqual(jump.get("target_resolution"), "dataflow-base")
+        self.assertEqual(jump["registers_in"]["B"], 0)
+        self.assertEqual(jump["target"], 0)
+        self.assertEqual(jump.get("target_resolution"), "register-postcondition-base")
+        edge = next(
+            edge for edge in report["edges"]
+            if edge["source"] == jump["address"] and edge["kind"] == "jump"
+        )
+        self.assertFalse(edge["resolved"])
+        self.assertEqual(edge["target"], 0)
 
 
 if __name__ == "__main__":
