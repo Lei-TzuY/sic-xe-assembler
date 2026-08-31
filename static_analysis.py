@@ -82,12 +82,7 @@ def _binary_register_operation(state, source, destination, operator):
 
 
 def transfer_register_state(node, incoming):
-    """Apply a conservative SIC/XE transfer function to one typed instruction.
-
-    The abstract state proves constants for A/X/L/B/S/T plus the condition code
-    (LT/EQ/GT). Unsupported or memory-dependent writes become unknown rather
-    than being guessed.
-    """
+    """Apply a conservative SIC/XE transfer function to one typed instruction."""
     state = _copy_state(incoming)
     mnemonic = node["base_mnemonic"]
     operand = node.get("operand") or ""
@@ -130,8 +125,6 @@ def transfer_register_state(node, incoming):
         _binary_register_operation(state, fields[0], fields[1], operation)
         return state
     if mnemonic in ("SHIFTL", "SHIFTR") and fields and fields[0] in state:
-        # The implementation deliberately does not encode a shift-semantics
-        # assumption into constant propagation; the destination is clobbered.
         state[fields[0]] = None
         return state
 
@@ -207,12 +200,11 @@ def transfer_register_state(node, incoming):
         return state
     if mnemonic in ("LPS", "SVC"):
         return unknown_state()
-
     return state
 
 
 def _written_registers(node):
-    """Return registers that the instruction may write for preserve summaries."""
+    """Return general registers that this instruction directly may write."""
     mnemonic = node["base_mnemonic"]
     operand = node.get("operand") or ""
     fields = _parse_register_operands(operand)
@@ -237,63 +229,125 @@ def _written_registers(node):
     if mnemonic in ("TIX", "TIXR"):
         return {"X"}
     if mnemonic == "JSUB":
-        # Nested calls are opaque to this deliberately local summary model.
-        return set(TRACKED_REGISTERS)
+        # The call instruction itself writes only the link register. Effects of
+        # the resolved callee are composed separately to a fixed point.
+        return {"L"}
     if mnemonic in ("LPS", "SVC"):
         return set(TRACKED_REGISTERS)
     return set()
 
 
-def summarize_subroutines(nodes, edges):
-    """Build conservative may-clobber/preserve summaries for resolved callees.
-
-    A register is preserved only when no instruction reachable from the callee
-    entry through non-call control flow may write it. Nested calls are treated
-    as opaque and therefore may clobber every tracked register.
-    """
+def _subroutine_shapes(nodes, edges):
     by_address = {node["address"]: node for node in nodes}
     outgoing = {}
+    calls_by_source = {}
     for edge in edges:
-        if not edge.get("resolved") or edge.get("target") not in by_address:
-            continue
-        outgoing.setdefault(edge["source"], []).append(edge)
+        if edge.get("kind") == "call":
+            calls_by_source.setdefault(edge["source"], []).append(edge)
+        if (
+            edge.get("resolved")
+            and edge.get("target") in by_address
+            and edge.get("kind") != "call"
+            and not edge.get("synthetic_return")
+        ):
+            outgoing.setdefault(edge["source"], []).append(edge)
 
     entries = sorted({
         edge["target"]
         for edge in edges
-        if edge.get("kind") == "call" and edge.get("resolved") and edge.get("target") in by_address
+        if edge.get("kind") == "call"
+        and edge.get("resolved")
+        and edge.get("target") in by_address
     })
-    summaries = {}
+    shapes = {}
     for entry in entries:
         visited = set()
         pending = [entry]
-        clobbered = set()
+        direct_clobbers = set()
         returns = []
+        nested_callees = set()
+        unresolved_calls = []
         while pending:
             address = pending.pop()
             if address in visited or address not in by_address:
                 continue
             visited.add(address)
             node = by_address[address]
-            clobbered |= _written_registers(node)
+            direct_clobbers |= _written_registers(node)
             if node["base_mnemonic"] == "RSUB":
                 returns.append(address)
                 continue
+            if node["base_mnemonic"] == "JSUB":
+                call_edges = calls_by_source.get(address, ())
+                resolved_targets = {
+                    edge.get("target")
+                    for edge in call_edges
+                    if edge.get("resolved") and edge.get("target") in by_address
+                }
+                nested_callees.update(resolved_targets)
+                if not call_edges or any(not edge.get("resolved") for edge in call_edges):
+                    unresolved_calls.append(address)
             for edge in outgoing.get(address, ()):
-                if edge.get("kind") == "call":
-                    continue
                 pending.append(edge["target"])
-
-        preserved = sorted(set(TRACKED_REGISTERS) - clobbered)
-        summaries[entry] = {
+        shapes[entry] = {
             "entry": entry,
             "symbols": list(by_address[entry].get("symbols") or ()),
-            "preserved": preserved,
-            "may_clobber": sorted(clobbered),
+            "direct_clobbers": direct_clobbers,
+            "nested_callees": nested_callees,
+            "unresolved_calls": sorted(set(unresolved_calls)),
             "return_sites": sorted(returns),
             "instruction_addresses": sorted(visited),
-            "may_return": bool(returns),
         }
+    return shapes
+
+
+def summarize_subroutines(nodes, edges):
+    """Build compositional may-clobber/preserve summaries for resolved callees.
+
+    Direct writes are combined with resolved nested-callee summaries until a
+    monotone fixed point. Unknown calls remain fully opaque. Recursive call
+    cycles are supported because may-clobber sets only grow.
+    """
+    shapes = _subroutine_shapes(nodes, edges)
+    summaries = {}
+    all_registers = set(TRACKED_REGISTERS)
+    for entry, shape in shapes.items():
+        clobbered = set(shape["direct_clobbers"])
+        if shape["unresolved_calls"]:
+            clobbered |= all_registers
+        summaries[entry] = {
+            "entry": entry,
+            "symbols": list(shape["symbols"]),
+            "preserved": sorted(all_registers - clobbered),
+            "may_clobber": sorted(clobbered),
+            "direct_clobbers": sorted(shape["direct_clobbers"]),
+            "nested_callees": sorted(shape["nested_callees"]),
+            "unresolved_calls": list(shape["unresolved_calls"]),
+            "return_sites": list(shape["return_sites"]),
+            "instruction_addresses": list(shape["instruction_addresses"]),
+            "may_return": bool(shape["return_sites"]),
+            "link_register_preserved": "L" not in clobbered,
+        }
+
+    changed = True
+    while changed:
+        changed = False
+        for entry, shape in shapes.items():
+            clobbered = set(shape["direct_clobbers"])
+            if shape["unresolved_calls"]:
+                clobbered |= all_registers
+            for callee in shape["nested_callees"]:
+                nested = summaries.get(callee)
+                if nested is None:
+                    clobbered |= all_registers
+                else:
+                    clobbered |= set(nested["may_clobber"])
+            new_clobbers = sorted(clobbered)
+            if new_clobbers != summaries[entry]["may_clobber"]:
+                summaries[entry]["may_clobber"] = new_clobbers
+                summaries[entry]["preserved"] = sorted(all_registers - clobbered)
+                summaries[entry]["link_register_preserved"] = "L" not in clobbered
+                changed = True
     return summaries
 
 
@@ -316,8 +370,6 @@ def _apply_subroutine_summary(outgoing, summary):
     for register in TRACKED_REGISTERS:
         if register not in preserved:
             result[register] = None
-    # A callee may modify condition code even when general registers are
-    # preserved; condition preservation is not claimed by this summary model.
     result["CC"] = None
     return result
 
@@ -330,13 +382,7 @@ def _edge_state(source_node, edge, outgoing, subroutine_summaries):
 
 
 def analyze_register_constants(nodes, edges, entry_address, initial_registers=None):
-    """Compute must-constant register/condition facts over resolved CFG edges.
-
-    The function also marks statically impossible conditional edges as
-    unresolved with a `condition-false` reason, so downstream reachability,
-    dominator, loop, and complexity analysis automatically consumes the
-    condition-sensitive graph.
-    """
+    """Compute must-constant register/condition facts over resolved CFG edges."""
     by_address = {node["address"]: node for node in nodes}
     incoming = {address: None for address in by_address}
     outgoing = {address: None for address in by_address}
@@ -360,7 +406,11 @@ def analyze_register_constants(nodes, edges, entry_address, initial_registers=No
 
     outgoing_edges = {}
     for edge in edges:
-        if edge.get("resolved") and edge.get("target") in by_address:
+        if (
+            edge.get("resolved")
+            and edge.get("target") in by_address
+            and not edge.get("synthetic_return")
+        ):
             outgoing_edges.setdefault(edge["source"], []).append(edge)
 
     pending = [entry_address]
@@ -387,8 +437,6 @@ def analyze_register_constants(nodes, edges, entry_address, initial_registers=No
                     pending.append(target)
                     queued.add(target)
 
-    # Prune only when the source condition is actually proven. Structural
-    # unresolved edges remain unresolved for their original reason.
     for edge in edges:
         source = by_address.get(edge.get("source"))
         state_out = outgoing.get(edge.get("source"))
@@ -416,10 +464,7 @@ def analyze_register_constants(nodes, edges, entry_address, initial_registers=No
 
 
 def resolve_dynamic_base_targets(nodes, register_facts):
-    """Re-decode b-relative typed instructions using the proven incoming B value.
-
-    Returns True when any decoded target/operand/base annotation changed.
-    """
+    """Re-decode b-relative typed instructions using the proven incoming B value."""
     changed = False
     for node in nodes:
         flags = node.get("flags") or ""
