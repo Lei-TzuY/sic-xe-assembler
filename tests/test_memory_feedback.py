@@ -93,9 +93,12 @@ class IntegratedMemoryFeedbackTests(unittest.TestCase):
             "      END ENTRY\n"
         )
         store = next(node for node in report["instructions"] if node["base_mnemonic"] == "STA")
-        load = next(
-            node for node in report["instructions"]
-            if node["base_mnemonic"] == "LDA" and node.get("memory_cell_read")
+        load = max(
+            (
+                node for node in report["instructions"]
+                if node["base_mnemonic"] == "LDA" and node.get("memory_cell_read")
+            ),
+            key=lambda node: node["address"],
         )
         dead = next(node for node in report["instructions"] if "DEAD" in node["symbols"])
         branch = next(node for node in report["instructions"] if node["base_mnemonic"] == "JLT")
