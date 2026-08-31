@@ -88,7 +88,7 @@ class IntegratedMemoryFeedbackTests(unittest.TestCase):
             "      JLT TAKEN\n"
             "DEAD  LDA #9\n"
             "TAKEN RSUB\n"
-            "SOURCE WORD 0\n"
+            "SOURCE RESW 1\n"
             "TEMP  RESW 1\n"
             "      END ENTRY\n"
         )
@@ -158,9 +158,14 @@ class IntegratedMemoryFeedbackTests(unittest.TestCase):
         load = next(node for node in report["instructions"] if node["base_mnemonic"] == "LDB")
         call = next(item for item in report["calls"] if item["resolved"])
         summary = call["memory_effect_summary"]
+        cell = load["memory_cell_read"]
 
-        self.assertIn(load["memory_cell_read"], summary["may_write_cells"])
-        self.assertIsNone(load["memory_constant"])
+        self.assertIn(cell, summary["may_write_cells"])
+        self.assertEqual(summary["return_constants"][cell], 1)
+        self.assertEqual(load["memory_constant"], 1)
+        self.assertEqual(load["registers_out"]["B"], 1)
+        # The may-reaching store layer remains conservative even while the
+        # independent must-value layer proves the callee's return value.
         self.assertTrue(any(source.startswith("MC") for source in load["memory_sources"]))
 
     def test_nested_callee_memory_summaries_compose(self):
