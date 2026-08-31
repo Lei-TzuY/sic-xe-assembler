@@ -11,6 +11,10 @@ from memory_feedback import (
     analyze_effect_aware_memory,
     refine_memory_feedback,
 )
+from memory_postconditions import (
+    attach_final_value_facts,
+    refine_initialized_memory_postconditions,
+)
 from reaching_definitions import analyze_reaching_definitions, enrich_function_contracts
 from static_analysis import summarize_subroutines
 
@@ -60,18 +64,37 @@ def _rebuild_structure(report):
     return report
 
 
-def _enrich_control_flow(report, base_register=None):
+def _enrich_control_flow(
+    report,
+    image,
+    image_start,
+    debug_map,
+    base_register=None,
+):
     nodes = report.get("instructions", [])
     edges = report.get("edges", [])
 
-    # First close the register/range <-> memory loop. This may prove a condition
-    # and prune an edge that the historical register-only core had to keep.
+    # Preserve the historical register/range <-> reaching-store refinement.
     feedback_memory = refine_memory_feedback(
         nodes,
         edges,
         report.get("entry_address"),
         base_register=base_register,
     )
+
+    # Then add a must-value memory domain. It seeds typed initialized bytes from
+    # the relocated linked image, composes callee return memory postconditions,
+    # and can resolve b-relative targets when B is proven through memory.
+    value_refinement = refine_initialized_memory_postconditions(
+        nodes,
+        edges,
+        report.get("entry_address"),
+        image,
+        image_start,
+        debug_map,
+        base_register=base_register,
+    )
+
     _rebuild_structure(report)
     edges = report.get("edges", [])
     blocks = report.get("blocks", [])
@@ -106,14 +129,14 @@ def _enrich_control_flow(report, base_register=None):
         node["definition_ids"] = dict(facts.get("definition_ids") or {})
         node["unresolved_uses"] = list(facts.get("unresolved_uses") or ())
 
-    # Rebuild memory chains once more after reaching definitions are available,
-    # so store definitions carry their register-definition provenance too.
+    # Keep may-reaching store provenance independent from must-value facts.
     memory = analyze_effect_aware_memory(
         nodes,
         edges,
         report.get("entry_address"),
     )
     _attach_memory_facts(nodes, memory)
+    attach_final_value_facts(nodes, value_refinement)
 
     functions, ownership, entry_to_id = analyze_functions(
         nodes,
@@ -125,11 +148,10 @@ def _enrich_control_flow(report, base_register=None):
     )
     enrich_function_contracts(functions, reaching)
     enrich_function_memory_contracts(functions, memory)
-    memory_summary_by_entry = {
-        item["entry"]: item for item in memory.get("memory_summaries", ())
-    }
+
+    value_summary_by_entry = dict(value_refinement.get("summary_map") or {})
     for function in functions:
-        function["memory_effect_summary"] = memory_summary_by_entry.get(function["entry"])
+        function["memory_effect_summary"] = value_summary_by_entry.get(function["entry"])
     for node in nodes:
         node["functions"] = list(ownership.get(node["address"], ()))
     for block in blocks:
@@ -145,7 +167,7 @@ def _enrich_control_flow(report, base_register=None):
             if call.get("resolved")
             else None
         )
-        call["memory_effect_summary"] = memory_summary_by_entry.get(call.get("target"))
+        call["memory_effect_summary"] = value_summary_by_entry.get(call.get("target"))
 
     dead_writes = [
         {
@@ -167,11 +189,18 @@ def _enrich_control_flow(report, base_register=None):
     report["unresolved_memory_reads"] = list(memory.get("unresolved_reads") or ())
     report["overwritten_stores"] = list(memory.get("overwritten_stores") or ())
     report["same_value_store_candidates"] = list(memory.get("same_value_store_candidates") or ())
-    report["memory_effect_summaries"] = list(memory.get("memory_summaries") or ())
+    report["memory_effect_summaries"] = list(value_refinement.get("summaries") or ())
+    report["initialized_memory"] = list(value_refinement.get("seeds") or ())
     report["memory_feedback"] = {
         "iterations": feedback_memory.get("feedback_iterations"),
         "converged": bool(feedback_memory.get("feedback_converged")),
+        "value_iterations": value_refinement.get("iterations"),
+        "value_converged": bool(value_refinement.get("converged")),
+        "initialized_cells": len(report["initialized_memory"]),
+        "memory_base_resolutions": value_refinement.get("memory_base_resolutions", 0),
+        "memory_range_base_resolutions": value_refinement.get("memory_range_base_resolutions", 0),
     }
+
     metrics = report.setdefault("metrics", {})
     metrics["functions"] = len(functions)
     metrics["dead_register_writes"] = sum(
@@ -195,6 +224,14 @@ def _enrich_control_flow(report, base_register=None):
     metrics["same_value_store_candidates"] = len(report["same_value_store_candidates"])
     metrics["memory_effect_summaries"] = len(report["memory_effect_summaries"])
     metrics["memory_feedback_iterations"] = feedback_memory.get("feedback_iterations", 0)
+    metrics["memory_value_iterations"] = value_refinement.get("iterations", 0)
+    metrics["initialized_memory_cells"] = len(report["initialized_memory"])
+    metrics["memory_base_resolutions"] = value_refinement.get("memory_base_resolutions", 0)
+    metrics["memory_range_base_resolutions"] = value_refinement.get("memory_range_base_resolutions", 0)
+    metrics["return_memory_postconditions"] = sum(
+        len(summary.get("return_value_cells") or ())
+        for summary in report["memory_effect_summaries"]
+    )
     metrics["memory_feedback_pruned_edges"] = sum(
         1
         for edge in edges
@@ -216,7 +253,13 @@ def analyze_control_flow(image, image_start, debug_map, entry_address, base_regi
         entry_address,
         base_register=base_register,
     )
-    return _enrich_control_flow(report, base_register=base_register)
+    return _enrich_control_flow(
+        report,
+        image,
+        image_start,
+        debug_map,
+        base_register=base_register,
+    )
 
 
 def _format_values(values):
@@ -234,6 +277,19 @@ def _format_optional_range(value):
     return str(low) if low == high else f"[{low},{high}]"
 
 
+def _format_summary_constants(summary):
+    values = summary.get("return_constants") or {}
+    return ",".join(f"{cell}={value:06X}" for cell, value in sorted(values.items())) or "-"
+
+
+def _format_summary_ranges(summary):
+    values = summary.get("return_ranges") or {}
+    return ",".join(
+        f"{cell}={_format_optional_range(interval)}"
+        for cell, interval in sorted(values.items())
+    ) or "-"
+
+
 def render_control_flow_report(report):
     base = _render_control_flow_report_core(report).rstrip("\n")
     feedback = report.get("memory_feedback") or {}
@@ -244,6 +300,11 @@ def render_control_flow_report(report):
             "MEMORY FEEDBACK "
             f"iterations={feedback.get('iterations', 0)} "
             f"converged={str(bool(feedback.get('converged'))).lower()} "
+            f"values={feedback.get('value_iterations', 0)} "
+            f"values-converged={str(bool(feedback.get('value_converged'))).lower()} "
+            f"initialized={feedback.get('initialized_cells', 0)} "
+            f"base-resolved={feedback.get('memory_base_resolutions', 0)} "
+            f"range-base-resolved={feedback.get('memory_range_base_resolutions', 0)} "
             f"pruned={report.get('metrics', {}).get('memory_feedback_pruned_edges', 0)}"
         ),
         "",
@@ -291,6 +352,18 @@ def render_control_flow_report(report):
         lines.append("  -")
 
     lines.extend(["", "MEMORY DATAFLOW"])
+    if report.get("initialized_memory"):
+        lines.append("  initialized cells:")
+        for item in report["initialized_memory"]:
+            parts = [
+                f"    {item['cell']}",
+                f"kind={item['region_kind']}",
+                f"bytes={item['bytes']}",
+            ]
+            if item.get("constant") is not None:
+                parts.append(f"value={_format_optional_constant(item['constant'])}")
+            lines.append(" ".join(parts))
+
     any_memory = False
     for node in report.get("instructions", ()):
         read_cell = node.get("memory_cell_read")
@@ -307,6 +380,8 @@ def render_control_flow_report(report):
                 parts.append(f"value={_format_optional_constant(node['memory_constant'])}")
             if node.get("memory_range") is not None:
                 parts.append(f"range={_format_optional_range(node['memory_range'])}")
+            if node.get("memory_value_resolution"):
+                parts.append(f"via={node['memory_value_resolution']}")
         if write_cell:
             parts.append(
                 f"write={write_cell}={node.get('store_definition_id') or '?'}"
@@ -332,6 +407,8 @@ def render_control_flow_report(report):
                 f"    {summary['entry']:05X} "
                 f"read={','.join(summary.get('may_read_cells') or ()) or '-'} "
                 f"write={','.join(summary.get('may_write_cells') or ()) or '-'} "
+                f"return={_format_summary_constants(summary)} "
+                f"return-range={_format_summary_ranges(summary)} "
                 f"unknown-read={str(bool(summary.get('unknown_read'))).lower()} "
                 f"unknown-write={str(bool(summary.get('unknown_write'))).lower()}"
             )
@@ -415,6 +492,8 @@ def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
                     additions.append(f"mem_const={node['memory_constant']:06X}")
                 elif node.get("memory_range") is not None:
                     additions.append("mem_range=" + _format_optional_range(node["memory_range"]))
+                if node.get("memory_value_resolution"):
+                    additions.append("mem_via=" + node["memory_value_resolution"])
             if node.get("store_definition_id"):
                 additions.append("mem_def=" + node["store_definition_id"])
             if node.get("functions"):
