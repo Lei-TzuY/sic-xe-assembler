@@ -110,7 +110,9 @@ class RegisterPostconditionTests(unittest.TestCase):
 
         compare = next(
             node for node in report["instructions"]
-            if node["base_mnemonic"] == "COMP" and node.get("operand") == "#0000A"
+            if node["base_mnemonic"] == "COMP"
+            and (node.get("operand") or "").startswith("#")
+            and node.get("target") == 10
         )
         self.assertIsNone(compare["registers_in"]["A"])
         self.assertEqual(compare["ranges_in"]["A"], (1, 2))
