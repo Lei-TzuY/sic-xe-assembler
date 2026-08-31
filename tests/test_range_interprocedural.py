@@ -122,6 +122,7 @@ class RangeInterproceduralTests(unittest.TestCase):
             "MAIN START 0\n"
             "     LDA VALUE\n"
             "     AND #0\n"
+            "     +ADD #0x4000\n"
             "     RMO A,B\n"
             "     BASE 0\n"
             "     J FAR\n"
@@ -132,7 +133,7 @@ class RangeInterproceduralTests(unittest.TestCase):
         )
         jump = next(node for node in report["instructions"] if node["base_mnemonic"] == "J")
         self.assertIsNone(jump["registers_in"]["B"])
-        self.assertEqual(jump["ranges_in"]["B"], (0, 0))
+        self.assertEqual(jump["ranges_in"]["B"], (0x4000, 0x4000))
         self.assertEqual(jump["target_resolution"], "range-singleton-base")
         far = next(node for node in report["instructions"] if "FAR" in node["symbols"])
         self.assertEqual(jump["target"], far["address"])
