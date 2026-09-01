@@ -12,4 +12,5 @@
 - `callsite-transfers.md` — single-source affine register return formulas, call-site exact/range substitution, symbolic CFG feedback, and returned-B target recovery.
 - `sparse-linear-transfers.md` — bounded multivariate linear register formulas, sparse coefficient vectors, nested substitution, call-site exact/range instantiation, and CFG feedback.
 - `symbolic-memory-transfers.md` — caller-independent memory-cell formulas over entry registers, nested substitution, call-site exact/range memory instantiation, and memory→register/CFG feedback.
+- `symbolic-memory-inputs.md` — direct memory cells as symbolic function inputs, memory↔register sparse formulas, nested composition, per-call memory/register substitution, and CFG feedback.
 - `analysis-contract.md` — trust boundary and fail-conservative guarantees.
