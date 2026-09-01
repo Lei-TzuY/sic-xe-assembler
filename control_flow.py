@@ -3,7 +3,7 @@ from control_flow_symbolic_inputs_base import *
 from control_flow_symbolic_inputs_base import analyze_control_flow as _analyze_control_flow_base
 from control_flow_symbolic_inputs_base import annotate_typed_disassembly as _annotate_typed_disassembly_base
 from control_flow_symbolic_inputs_base import render_control_flow_report as _render_control_flow_report_base
-from guarded_transfer_refinement import (
+from guarded_memory_refinement import (
     infer_guarded_transfer_summaries,
     refine_guarded_transfers,
 )
@@ -91,9 +91,15 @@ def _attach_guarded_layer(report, refinement):
     ]
     report["guarded_transfers"] = {
         "iterations": refinement.get("iterations", 0),
+        "summary_inference_iterations": refinement.get(
+            "summary_inference_iterations", 0
+        ),
         "converged": bool(refinement.get("converged")),
         "guarded_functions": refinement.get("guarded_functions", 0),
         "guarded_cases": refinement.get("guarded_cases", 0),
+        "nested_composed_calls": refinement.get("nested_composed_calls", 0),
+        "memory_identity_outputs": refinement.get("memory_identity_outputs", 0),
+        "memory_unknown_outputs": refinement.get("memory_unknown_outputs", 0),
         "base_resolutions": refinement.get("base_resolutions", 0),
         "range_base_resolutions": refinement.get("range_base_resolutions", 0),
     }
@@ -123,8 +129,20 @@ def _attach_guarded_layer(report, refinement):
 
     metrics = report.setdefault("metrics", {})
     metrics["guarded_transfer_iterations"] = refinement.get("iterations", 0)
+    metrics["guarded_transfer_summary_inference_iterations"] = refinement.get(
+        "summary_inference_iterations", 0
+    )
     metrics["guarded_transfer_functions"] = refinement.get("guarded_functions", 0)
     metrics["guarded_transfer_cases"] = refinement.get("guarded_cases", 0)
+    metrics["guarded_transfer_nested_composed_calls"] = refinement.get(
+        "nested_composed_calls", 0
+    )
+    metrics["guarded_transfer_memory_identity_outputs"] = refinement.get(
+        "memory_identity_outputs", 0
+    )
+    metrics["guarded_transfer_memory_unknown_outputs"] = refinement.get(
+        "memory_unknown_outputs", 0
+    )
     metrics["guarded_transfer_instantiations"] = len(instantiations)
     metrics["guarded_transfer_selected_single_case"] = sum(
         1
@@ -186,6 +204,7 @@ def _inference_only_refinement(inferred):
     summary_map = dict(inferred.get("summary_map") or {})
     return {
         "iterations": 0,
+        "summary_inference_iterations": inferred.get("iterations", 0),
         "converged": True,
         "summary_map": summary_map,
         "summaries": summaries,
@@ -194,6 +213,9 @@ def _inference_only_refinement(inferred):
         "range_base_resolutions": 0,
         "guarded_functions": 0,
         "guarded_cases": 0,
+        "nested_composed_calls": 0,
+        "memory_identity_outputs": 0,
+        "memory_unknown_outputs": 0,
     }
 
 
@@ -273,10 +295,29 @@ def _format_guard(guard):
     return f"{left} ? {right} in {{{allowed}}}"
 
 
+def _format_output_spec(spec):
+    if not spec:
+        return "?"
+    kind = spec.get("kind")
+    if kind == "identity":
+        return "identity"
+    if kind == "unknown":
+        return "?"
+    return _base._format_input_transfer(spec)
+
+
 def _format_outputs(outputs, prefix=""):
     return ",".join(
-        f"{prefix}{name}={_base._format_input_transfer(spec)}"
+        f"{prefix}{name}={_format_output_spec(spec)}"
         for name, spec in sorted((outputs or {}).items())
+    ) or "-"
+
+
+def _format_nested_cases(case):
+    items = case.get("nested_cases") or ()
+    return ",".join(
+        f"{item.get('call_source', 0):05X}->{item.get('callee_entry', 0):05X}:{item.get('case_id', '?')}"
+        for item in items
     ) or "-"
 
 
@@ -289,9 +330,13 @@ def render_control_flow_report(report):
         (
             "GUARDED CALL TRANSFERS "
             f"iterations={status.get('iterations', 0)} "
+            f"summary-iterations={status.get('summary_inference_iterations', 0)} "
             f"converged={str(bool(status.get('converged'))).lower()} "
             f"functions={status.get('guarded_functions', 0)} "
             f"cases={status.get('guarded_cases', 0)} "
+            f"nested={status.get('nested_composed_calls', 0)} "
+            f"identity={status.get('memory_identity_outputs', 0)} "
+            f"unknown={status.get('memory_unknown_outputs', 0)} "
             f"base-resolved={status.get('base_resolutions', 0)} "
             f"range-base-resolved={status.get('range_base_resolutions', 0)} "
             f"pruned={report.get('metrics', {}).get('guarded_transfer_pruned_edges', 0)}"
@@ -306,6 +351,8 @@ def render_control_flow_report(report):
         any_summary = True
         lines.append(
             f"  {summary['entry']:05X} cases={len(cases)} "
+            f"memory-cells={','.join(summary.get('memory_contract_cells') or ()) or '-'} "
+            f"nested-calls={summary.get('guarded_nested_composed_calls', 0)} "
             f"link-preserved={str(bool(summary.get('link_register_preserved'))).lower()}"
         )
         for case in cases:
@@ -318,7 +365,8 @@ def render_control_flow_report(report):
             if memory != "-":
                 memory = memory.replace("=", "]=", 1)
             lines.append(
-                f"    {case['id']} if {guards} -> regs={registers} mem={memory}"
+                f"    {case['id']} if {guards} -> regs={registers} "
+                f"mem={memory} nested={_format_nested_cases(case)}"
             )
     if not any_summary:
         lines.append("  -")
@@ -336,10 +384,14 @@ def render_control_flow_report(report):
                 f"{name}={value:06X}"
                 for name, value in sorted((item.get("exact_memory") or {}).items())
             ) or "-"
+            modes = ",".join(
+                f"{name}:{mode}"
+                for name, mode in sorted((item.get("memory_modes") or {}).items())
+            ) or "-"
             lines.append(
                 f"    {item['call_address']:05X} -> {item.get('callee_entry', 0):05X} "
                 f"feasible={feasible} ruled-out={ruled} "
-                f"regs={exact_regs} mem={exact_mem}"
+                f"regs={exact_regs} mem={exact_mem} modes={modes}"
             )
     return "\n".join(lines) + "\n"
 
@@ -380,6 +432,12 @@ def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
             )
             if exact:
                 additions.append("guard_xfer=" + exact)
+            modes = ",".join(
+                f"{name}:{mode}"
+                for name, mode in sorted((item.get("memory_modes") or {}).items())
+            )
+            if modes:
+                additions.append("guard_mem=" + modes)
             if additions:
                 line += " ; " + "; ".join(additions)
         lines.append(line)
