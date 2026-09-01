@@ -143,11 +143,30 @@ class RegisterPostconditionTests(unittest.TestCase):
         summary = self._summary_for_symbol(report, "ROUTN")
         self.assertNotIn("A", summary["return_constants"])
         self.assertNotIn("A", summary["return_ranges"])
+
+        # The legacy caller-independent register contract remains deliberately
+        # empty.  A later memory-input layer may nevertheless instantiate the
+        # direct caller memory at this one call site without polluting it.
+        call = next(
+            node for node in report["instructions"]
+            if node["base_mnemonic"] == "JSUB"
+        )
+        self.assertEqual(
+            call["symbolic_memory_input_instantiation"]["exact_registers"]["A"],
+            7,
+        )
         compare = next(node for node in report["instructions"] if node["base_mnemonic"] == "COMP")
-        self.assertIsNone(compare["registers_in"]["A"])
+        self.assertEqual(compare["registers_in"]["A"], 7)
         branch = next(node for node in report["instructions"] if node["base_mnemonic"] == "JEQ")
-        outgoing = [edge for edge in report["edges"] if edge["source"] == branch["address"]]
-        self.assertTrue(all(edge["resolved"] for edge in outgoing))
+        fallthrough = next(
+            edge for edge in report["edges"]
+            if edge["source"] == branch["address"] and edge["kind"] == "fallthrough"
+        )
+        self.assertFalse(fallthrough["resolved"])
+        self.assertEqual(
+            fallthrough["resolution"],
+            "symbolic-memory-input-condition",
+        )
 
     def test_partial_output_path_does_not_invent_return_value(self):
         _, report = self.assemble_and_link(
