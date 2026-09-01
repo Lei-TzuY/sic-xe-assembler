@@ -112,7 +112,10 @@ class GuardedTransferTests(unittest.TestCase):
         )
         fallthrough = self.edge(report, branch["address"], "fallthrough")
         self.assertFalse(fallthrough["resolved"])
-        self.assertEqual(fallthrough["resolution"], "guarded-transfer-condition")
+        self.assertEqual(
+            fallthrough["resolution"],
+            "register-postcondition-condition",
+        )
 
     def test_same_piecewise_summary_instantiates_differently_at_two_calls(self):
         report = self.assemble_and_link(
@@ -190,7 +193,7 @@ class GuardedTransferTests(unittest.TestCase):
         self.assertFalse(fallthrough["resolved"])
         self.assertEqual(
             fallthrough["resolution"],
-            "guarded-transfer-condition",
+            "register-postcondition-condition",
         )
 
     def test_memory_root_guard_selects_case_from_initialized_cell(self):
