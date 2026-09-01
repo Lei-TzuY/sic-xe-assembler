@@ -1,4 +1,4 @@
-import guarded_transfer_refinement as _base
+import guarded_condition_refinement as _base
 import guarded_transfers as _legacy
 from memory_feedback import summarize_memory_effects
 
