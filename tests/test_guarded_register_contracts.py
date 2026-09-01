@@ -122,9 +122,14 @@ class GuardedRegisterContractTests(unittest.TestCase):
             and node["address"] > call["address"]
         )
         self.assertEqual(jump["target"], self.entry_for(report, "FAR"))
+        # Guarded identity is the semantic evidence that B survives the call.
+        # If an earlier dataflow pass already owns the resulting target proof,
+        # the later guarded layer must not relabel it.
         self.assertIn(
             jump["target_resolution"],
             {
+                "dataflow-base",
+                "range-singleton-base",
                 "guarded-transfer-base",
                 "guarded-transfer-range-base",
             },
