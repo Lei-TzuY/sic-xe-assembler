@@ -37,14 +37,27 @@ does not equate "outside typed code" with program termination.
 
 ## Call-site instantiation
 
-The caller's exact/range register and direct-memory facts filter the returnability
+The caller's exact/range register and direct-memory facts filter returnability
 cases with the same guarded-case feasibility rules used for value contracts.
-The resulting `guarded_transfer_instantiation` exposes:
+When the guarded refinement is active, a useful call-site control contract may
+expose:
 
 - `return_mode`: `returns`, `no-return`, `mixed`, or `unknown`;
 - `returnability_known`;
 - `must_return`, `may_return`, and `must_not_return`;
 - `return_feasible_cases` and `return_ruled_out_cases`.
+
+The historical guarded fast path is preserved: a function whose returnability is
+only unknown and has no actionable guarded value/control refinement does not force
+a second whole-program fixed point merely to emit an `unknown` call-site object.
+Its function summary still records the `returns=null` cases and the caller
+continuation remains unchanged.
+
+The established link-register gate is also preserved. Returning, mixed, and
+unknown metadata does not create a guarded call-site instantiation when `L`
+preservation is unproven. A proven `no-return` case is the deliberate exception:
+it does not consume continuation state and therefore does not require an `L`
+return proof.
 
 When every feasible case is proven `no-return`, the call's fallthrough edge is
 marked infeasible with `resolution="guarded-returnability"` and
