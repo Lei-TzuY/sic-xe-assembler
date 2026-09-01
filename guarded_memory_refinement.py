@@ -3,7 +3,7 @@ from guarded_case_feasibility import conjunctive_case_feasible
 
 _legacy._case_feasible = conjunctive_case_feasible
 
-import guarded_condition_refinement as _base
+import guarded_return_refinement as _base
 from memory_feedback import summarize_memory_effects
 
 
