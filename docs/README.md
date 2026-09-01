@@ -13,4 +13,5 @@
 - `sparse-linear-transfers.md` — bounded multivariate linear register formulas, sparse coefficient vectors, nested substitution, call-site exact/range instantiation, and CFG feedback.
 - `symbolic-memory-transfers.md` — caller-independent memory-cell formulas over entry registers, nested substitution, call-site exact/range memory instantiation, and memory→register/CFG feedback.
 - `symbolic-memory-inputs.md` — direct memory cells as symbolic function inputs, memory↔register sparse formulas, nested composition, per-call memory/register substitution, and CFG feedback.
+- `guarded-transfers.md` — bounded path-sensitive return cases over symbolic COMP/COMPR guards, call-site case filtering, exact/range joins, and guarded CFG feedback.
 - `analysis-contract.md` — trust boundary and fail-conservative guarantees.
