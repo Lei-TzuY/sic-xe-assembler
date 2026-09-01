@@ -90,7 +90,10 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
     def test_multivariate_memory_return_instantiates_and_prunes_branch(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
-            "ENTRY LDA #1\n"
+            "ENTRY LDA #9\n"
+            "      LDX #1\n"
+            "      +JSUB SETVAL\n"
+            "      LDA #1\n"
             "      LDX #2\n"
             "      +JSUB SETVAL\n"
             "      CLEAR A\n"
@@ -110,8 +113,8 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
         spec = summary["return_memory_linear_transfers"][cell]
         self.assertEqual(spec["kind"], "linear")
         self.assertEqual(spec["coefficients"], {"A": 1, "X": 1})
-        call = next(node for node in report["instructions"] if node["base_mnemonic"] == "JSUB")
-        self.assertEqual(call["symbolic_memory_instantiation"]["exact"][cell], 3)
+        calls = [node for node in report["instructions"] if node["base_mnemonic"] == "JSUB"]
+        self.assertEqual(calls[-1]["symbolic_memory_instantiation"]["exact"][cell], 3)
         compare = next(node for node in report["instructions"] if node["base_mnemonic"] == "COMP")
         load = self.load_before(report, compare)
         self.assertEqual(load["memory_constant"], 3)
@@ -127,7 +130,10 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
     def test_multivariate_memory_formula_instantiates_caller_range(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
-            "ENTRY COMP FLAG\n"
+            "ENTRY LDA #20\n"
+            "      CLEAR X\n"
+            "      +JSUB SETVAL\n"
+            "      COMP FLAG\n"
             "      JEQ ONE\n"
             "      LDA #2\n"
             "      J JOIN\n"
@@ -148,7 +154,8 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
             "      END ENTRY\n"
         )
         cell = self.slot_cell(report)
-        call = next(node for node in report["instructions"] if node["base_mnemonic"] == "JSUB")
+        calls = [node for node in report["instructions"] if node["base_mnemonic"] == "JSUB"]
+        call = calls[-1]
         self.assertNotIn(cell, call["symbolic_memory_instantiation"]["exact"])
         self.assertEqual(call["symbolic_memory_instantiation"]["ranges"][cell], [4, 5])
         compare = max(
