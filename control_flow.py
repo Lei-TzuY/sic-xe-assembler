@@ -1,9 +1,9 @@
-import control_flow_symbolic_memory_base as _base
-from control_flow_symbolic_memory_base import *
-from control_flow_symbolic_memory_base import analyze_control_flow as _analyze_control_flow_base
-from control_flow_symbolic_memory_base import annotate_typed_disassembly as _annotate_typed_disassembly_base
-from control_flow_symbolic_memory_base import render_control_flow_report as _render_control_flow_report_base
-from symbolic_memory_inputs import refine_symbolic_memory_inputs
+import control_flow_symbolic_inputs_base as _base
+from control_flow_symbolic_inputs_base import *
+from control_flow_symbolic_inputs_base import analyze_control_flow as _analyze_control_flow_base
+from control_flow_symbolic_inputs_base import annotate_typed_disassembly as _annotate_typed_disassembly_base
+from control_flow_symbolic_inputs_base import render_control_flow_report as _render_control_flow_report_base
+from guarded_transfers import refine_guarded_transfers
 
 
 def _summary_by_entry(items):
@@ -26,14 +26,10 @@ def _instantiation_by_call(items):
     }
 
 
-def _snapshot_symbolic_memory(report):
-    summaries = list(
-        report.get("symbolic_memory_transfer_summaries") or ()
-    )
-    instantiations = list(
-        report.get("symbolic_memory_instantiations") or ()
-    )
-    status = dict(report.get("symbolic_memory_transfers") or {})
+def _snapshot_symbolic_input_refinement(report):
+    summaries = list(report.get("symbolic_memory_input_summaries") or ())
+    instantiations = list(report.get("symbolic_memory_input_instantiations") or ())
+    status = dict(report.get("symbolic_memory_inputs") or {})
     return {
         "iterations": status.get("iterations", 0),
         "converged": bool(status.get("converged")),
@@ -41,230 +37,139 @@ def _snapshot_symbolic_memory(report):
         "summaries": summaries,
         "instantiations": _instantiation_by_call(instantiations),
         "base_resolutions": status.get("base_resolutions", 0),
-        "range_base_resolutions": status.get(
-            "range_base_resolutions",
-            0,
-        ),
-        "multivariate_transfers": status.get(
-            "multivariate_transfers",
-            0,
-        ),
+        "range_base_resolutions": status.get("range_base_resolutions", 0),
+        "return_register_transfers": status.get("return_register_transfers", 0),
+        "return_memory_transfers": status.get("return_memory_transfers", 0),
     }
 
 
-def _snapshot_prior_ownership(report):
-    targets = {}
-    for node in report.get("instructions", ()):
-        if node.get("target_resolution") is None:
-            continue
-        targets[node["address"]] = {
-            "operand": node.get("operand"),
-            "target": node.get("target"),
-            "warning": node.get("warning"),
-            "base_value": node.get("base_value"),
-            "target_resolution": node.get("target_resolution"),
+def _guard_base_summaries(report):
+    symbolic = _summary_by_entry(report.get("symbolic_memory_input_summaries"))
+    sparse = _summary_by_entry(report.get("sparse_linear_transfer_summaries"))
+    result = {}
+    for entry, item in symbolic.items():
+        merged = dict(item)
+        register = sparse.get(entry) or {}
+        merged["return_constants"] = dict(register.get("return_constants") or {})
+        merged["return_ranges"] = {
+            key: list(value)
+            for key, value in (register.get("return_ranges") or {}).items()
         }
-
-    edges = {}
-    for edge in report.get("edges", ()):
-        if edge.get("resolution") is None:
-            continue
-        key = (
-            edge.get("source"),
-            edge.get("target"),
-            edge.get("kind"),
+        merged["return_conditions"] = list(register.get("return_conditions") or ())
+        merged["return_linear_transfers"] = dict(
+            register.get("return_linear_transfers") or {}
         )
-        edges[key] = {
-            "resolved": bool(edge.get("resolved")),
-            "feasible": edge.get("feasible"),
-            "reason": edge.get("reason"),
-            "resolution": edge.get("resolution"),
-        }
-    return {"targets": targets, "edges": edges}
+        result[entry] = merged
+    return result
 
 
 def _restore_prior_ownership(report, ownership, refinement):
-    by_address = {
-        node["address"]: node
-        for node in report.get("instructions", ())
-    }
-    for address, saved in ownership["targets"].items():
-        node = by_address.get(address)
-        if node is None:
-            continue
-        node["operand"] = saved["operand"]
-        node["target"] = saved["target"]
-        node["warning"] = saved["warning"]
-        node["target_resolution"] = saved[
-            "target_resolution"
-        ]
-        if saved["base_value"] is None:
-            node.pop("base_value", None)
-        else:
-            node["base_value"] = saved["base_value"]
-
-    by_edge = {
-        (
-            edge.get("source"),
-            edge.get("target"),
-            edge.get("kind"),
-        ): edge
-        for edge in report.get("edges", ())
-    }
-    for key, saved in ownership["edges"].items():
-        edge = by_edge.get(key)
-        if edge is None:
-            continue
-        edge["resolved"] = saved["resolved"]
-        if saved["feasible"] is None:
-            edge.pop("feasible", None)
-        else:
-            edge["feasible"] = saved["feasible"]
-        if saved["reason"] is None:
-            edge.pop("reason", None)
-        else:
-            edge["reason"] = saved["reason"]
-        edge["resolution"] = saved["resolution"]
-
+    _base._restore_prior_ownership(report, ownership, refinement)
     refinement["base_resolutions"] = sum(
         1
         for node in report.get("instructions", ())
-        if node.get("target_resolution")
-        == "symbolic-memory-input-base"
+        if node.get("target_resolution") == "guarded-transfer-base"
     )
     refinement["range_base_resolutions"] = sum(
         1
         for node in report.get("instructions", ())
-        if node.get("target_resolution")
-        == "symbolic-memory-input-range-base"
+        if node.get("target_resolution") == "guarded-transfer-range-base"
     )
 
 
-def _refresh_after_symbolic_memory_inputs(
+def _refresh_after_guarded(
     report,
     refinement,
+    input_snapshot,
     symbolic_snapshot,
     sparse_snapshot,
     legacy_snapshot,
 ):
-    report = _base._refresh_after_symbolic_memory(
+    report = _base._refresh_after_symbolic_memory_inputs(
         report,
+        input_snapshot,
         symbolic_snapshot,
         sparse_snapshot,
         legacy_snapshot,
     )
 
     summaries = list(refinement.get("summaries") or ())
-    summary_by_entry = dict(
-        refinement.get("summary_map") or {}
-    )
-    instantiations = dict(
-        refinement.get("instantiations") or {}
-    )
-
-    report["symbolic_memory_input_summaries"] = summaries
-    report["symbolic_memory_input_instantiations"] = [
+    summary_by_entry = dict(refinement.get("summary_map") or {})
+    instantiations = dict(refinement.get("instantiations") or {})
+    report["guarded_transfer_summaries"] = summaries
+    report["guarded_transfer_instantiations"] = [
         {"call_address": address, **item}
         for address, item in sorted(instantiations.items())
     ]
-    report["symbolic_memory_inputs"] = {
+    report["guarded_transfers"] = {
         "iterations": refinement.get("iterations", 0),
         "converged": bool(refinement.get("converged")),
-        "base_resolutions": refinement.get(
-            "base_resolutions",
-            0,
-        ),
-        "range_base_resolutions": refinement.get(
-            "range_base_resolutions",
-            0,
-        ),
-        "return_register_transfers": refinement.get(
-            "return_register_transfers",
-            0,
-        ),
-        "return_memory_transfers": refinement.get(
-            "return_memory_transfers",
-            0,
-        ),
+        "guarded_functions": refinement.get("guarded_functions", 0),
+        "guarded_cases": refinement.get("guarded_cases", 0),
+        "base_resolutions": refinement.get("base_resolutions", 0),
+        "range_base_resolutions": refinement.get("range_base_resolutions", 0),
     }
 
     for node in report.get("instructions", ()):
         if node["base_mnemonic"] != "JSUB":
             continue
-        target = node.get("target")
         source = node["address"]
-        node["symbolic_memory_input_summary"] = (
-            summary_by_entry.get(target)
-        )
+        target = node.get("target")
+        node["guarded_transfer_summary"] = summary_by_entry.get(target)
         item = instantiations.get(source)
         if item is None:
-            node.pop(
-                "symbolic_memory_input_instantiation",
-                None,
-            )
+            node.pop("guarded_transfer_instantiation", None)
         else:
-            node[
-                "symbolic_memory_input_instantiation"
-            ] = item
+            node["guarded_transfer_instantiation"] = item
 
     for function in report.get("functions", ()):
-        function["symbolic_memory_input_summary"] = (
-            summary_by_entry.get(function["entry"])
+        function["guarded_transfer_summary"] = summary_by_entry.get(
+            function["entry"]
         )
 
     for call in report.get("calls", ()):
         source = call.get("source")
         target = call.get("target")
-        call["symbolic_memory_input_summary"] = (
-            summary_by_entry.get(target)
-        )
-        call["symbolic_memory_input_instantiation"] = (
-            instantiations.get(source)
-        )
+        call["guarded_transfer_summary"] = summary_by_entry.get(target)
+        call["guarded_transfer_instantiation"] = instantiations.get(source)
 
     metrics = report.setdefault("metrics", {})
-    metrics["symbolic_memory_input_iterations"] = (
-        refinement.get("iterations", 0)
+    metrics["guarded_transfer_iterations"] = refinement.get("iterations", 0)
+    metrics["guarded_transfer_functions"] = refinement.get("guarded_functions", 0)
+    metrics["guarded_transfer_cases"] = refinement.get("guarded_cases", 0)
+    metrics["guarded_transfer_instantiations"] = len(instantiations)
+    metrics["guarded_transfer_selected_single_case"] = sum(
+        1
+        for item in instantiations.values()
+        if len(item.get("feasible_cases") or ()) == 1
     )
-    metrics["symbolic_memory_input_return_registers"] = (
-        refinement.get("return_register_transfers", 0)
-    )
-    metrics["symbolic_memory_input_return_cells"] = (
-        refinement.get("return_memory_transfers", 0)
-    )
-    metrics["symbolic_memory_input_instantiations"] = len(
-        instantiations
-    )
-    metrics["symbolic_memory_input_exact_registers"] = sum(
+    metrics["guarded_transfer_exact_registers"] = sum(
         len(item.get("exact_registers") or {})
         for item in instantiations.values()
     )
-    metrics["symbolic_memory_input_range_registers"] = sum(
+    metrics["guarded_transfer_range_registers"] = sum(
         len(item.get("range_registers") or {})
         for item in instantiations.values()
     )
-    metrics["symbolic_memory_input_exact_cells"] = sum(
+    metrics["guarded_transfer_exact_cells"] = sum(
         len(item.get("exact_memory") or {})
         for item in instantiations.values()
     )
-    metrics["symbolic_memory_input_range_cells"] = sum(
+    metrics["guarded_transfer_range_cells"] = sum(
         len(item.get("range_memory") or {})
         for item in instantiations.values()
     )
-    metrics["symbolic_memory_input_base_resolutions"] = (
-        refinement.get("base_resolutions", 0)
+    metrics["guarded_transfer_base_resolutions"] = refinement.get(
+        "base_resolutions", 0
     )
-    metrics[
-        "symbolic_memory_input_range_base_resolutions"
-    ] = refinement.get("range_base_resolutions", 0)
-    metrics["symbolic_memory_input_pruned_edges"] = sum(
+    metrics["guarded_transfer_range_base_resolutions"] = refinement.get(
+        "range_base_resolutions", 0
+    )
+    metrics["guarded_transfer_pruned_edges"] = sum(
         1
         for edge in report.get("edges", ())
         if edge.get("resolution")
-        in (
-            "symbolic-memory-input-condition",
-            "symbolic-memory-input-range-condition",
-        )
+        in ("guarded-transfer-condition", "guarded-transfer-range-condition")
         and not edge.get("resolved")
     )
     return report
@@ -284,193 +189,122 @@ def analyze_control_flow(
         entry_address,
         base_register=base_register,
     )
-    legacy_snapshot = _base._snapshot_legacy_callsite(
-        report
-    )
-    sparse_snapshot = _base._snapshot_sparse(report)
-    symbolic_snapshot = _snapshot_symbolic_memory(report)
-    ownership = _snapshot_prior_ownership(report)
+    legacy_snapshot = _base._base._snapshot_legacy_callsite(report)
+    sparse_snapshot = _base._base._snapshot_sparse(report)
+    symbolic_snapshot = _base._snapshot_symbolic_memory(report)
+    input_snapshot = _snapshot_symbolic_input_refinement(report)
+    ownership = _base._snapshot_prior_ownership(report)
 
-    refinement = refine_symbolic_memory_inputs(
+    guard_summaries = _guard_base_summaries(report)
+    refinement = refine_guarded_transfers(
         report.get("instructions", []),
         report.get("edges", []),
         report.get("entry_address"),
         image,
         image_start,
         debug_map,
-        register_summaries=_summary_by_entry(
-            report.get(
-                "sparse_linear_transfer_summaries"
-            )
+        base_summaries=guard_summaries,
+        base_instantiations=_instantiation_by_call(
+            report.get("symbolic_memory_input_instantiations")
         ),
-        memory_summaries=_summary_by_entry(
-            report.get(
-                "symbolic_memory_transfer_summaries"
-            )
+        base_memory_summaries=_summary_by_entry(
+            report.get("symbolic_memory_transfer_summaries")
         ),
-        memory_instantiations=_instantiation_by_call(
+        base_memory_instantiations=_instantiation_by_call(
             report.get("symbolic_memory_instantiations")
         ),
         base_register=base_register,
     )
-    _restore_prior_ownership(
-        report,
-        ownership,
-        refinement,
-    )
-    return _refresh_after_symbolic_memory_inputs(
+    _restore_prior_ownership(report, ownership, refinement)
+    return _refresh_after_guarded(
         report,
         refinement,
+        input_snapshot,
         symbolic_snapshot,
         sparse_snapshot,
         legacy_snapshot,
     )
 
 
-def _format_term(body, coefficient, first):
-    sign = (
-        "-"
-        if coefficient < 0
-        else ("" if first else "+")
-    )
-    magnitude = abs(coefficient)
-    if magnitude != 1:
-        body = f"{magnitude}*{body}"
-    return sign + body
+def _format_guard(guard):
+    left = _base._format_input_transfer(guard.get("left"))
+    right = _base._format_input_transfer(guard.get("right"))
+    allowed = "/".join(guard.get("allowed") or ()) or "?"
+    return f"{left} ? {right} in {{{allowed}}}"
 
 
-def _format_input_transfer(spec):
-    if not spec:
-        return "?"
-    parts = []
-    for register, coefficient in sorted(
-        (spec.get("register_coefficients") or {}).items()
-    ):
-        if coefficient:
-            parts.append(
-                _format_term(
-                    register,
-                    coefficient,
-                    not parts,
-                )
-            )
-    for cell_id, coefficient in sorted(
-        (spec.get("memory_coefficients") or {}).items()
-    ):
-        if coefficient:
-            parts.append(
-                _format_term(
-                    f"MEM[{cell_id}]",
-                    coefficient,
-                    not parts,
-                )
-            )
-    offset = spec.get("offset", 0)
-    if offset > 0:
-        parts.append(("+" if parts else "") + str(offset))
-    elif offset < 0:
-        parts.append(str(offset))
-    return "".join(parts) or "0"
+def _format_outputs(outputs, prefix=""):
+    return ",".join(
+        f"{prefix}{name}={_base._format_input_transfer(spec)}"
+        for name, spec in sorted((outputs or {}).items())
+    ) or "-"
 
 
 def render_control_flow_report(report):
-    base = _render_control_flow_report_base(
-        report
-    ).rstrip("\n")
-    status = report.get("symbolic_memory_inputs") or {}
+    base = _render_control_flow_report_base(report).rstrip("\n")
+    status = report.get("guarded_transfers") or {}
     lines = [
         base,
         "",
         (
-            "SYMBOLIC MEMORY INPUT TRANSFERS "
+            "GUARDED CALL TRANSFERS "
             f"iterations={status.get('iterations', 0)} "
             f"converged={str(bool(status.get('converged'))).lower()} "
-            f"register-returns={status.get('return_register_transfers', 0)} "
-            f"memory-returns={status.get('return_memory_transfers', 0)} "
+            f"functions={status.get('guarded_functions', 0)} "
+            f"cases={status.get('guarded_cases', 0)} "
             f"base-resolved={status.get('base_resolutions', 0)} "
             f"range-base-resolved={status.get('range_base_resolutions', 0)} "
-            f"pruned={report.get('metrics', {}).get('symbolic_memory_input_pruned_edges', 0)}"
+            f"pruned={report.get('metrics', {}).get('guarded_transfer_pruned_edges', 0)}"
         ),
     ]
 
     any_summary = False
-    for summary in report.get(
-        "symbolic_memory_input_summaries",
-        (),
-    ):
-        register_transfers = summary.get(
-            "return_register_memory_transfers"
-        ) or {}
-        memory_transfers = summary.get(
-            "return_memory_input_transfers"
-        ) or {}
-        if not register_transfers and not memory_transfers:
+    for summary in report.get("guarded_transfer_summaries", ()):
+        cases = summary.get("guarded_cases") or ()
+        if not cases:
             continue
         any_summary = True
-        registers = ",".join(
-            f"{register}={_format_input_transfer(spec)}"
-            for register, spec in sorted(
-                register_transfers.items()
-            )
-        ) or "-"
-        memory = ",".join(
-            f"{cell_id}={_format_input_transfer(spec)}"
-            for cell_id, spec in sorted(
-                memory_transfers.items()
-            )
-        ) or "-"
         lines.append(
-            f"  {summary['entry']:05X} "
-            f"register={registers} memory={memory} "
-            f"memory-inputs={','.join(summary.get('memory_input_cells') or ()) or '-'} "
-            f"register-inputs={','.join(summary.get('memory_input_registers') or ()) or '-'} "
+            f"  {summary['entry']:05X} cases={len(cases)} "
             f"link-preserved={str(bool(summary.get('link_register_preserved'))).lower()}"
         )
+        for case in cases:
+            guards = " && ".join(
+                _format_guard(guard)
+                for guard in case.get("guards", ())
+            ) or "true"
+            registers = _format_outputs(case.get("register_outputs"))
+            memory = _format_outputs(case.get("memory_outputs"), "MEM[")
+            if memory != "-":
+                memory = memory.replace("=", "]=", 1)
+            lines.append(
+                f"    {case['id']} if {guards} -> regs={registers} mem={memory}"
+            )
     if not any_summary:
         lines.append("  -")
 
-    if report.get("symbolic_memory_input_instantiations"):
-        lines.append("  call-site instantiations:")
-        for item in report[
-            "symbolic_memory_input_instantiations"
-        ]:
-            exact_registers = ",".join(
-                f"{register}={value:06X}"
-                for register, value in sorted(
-                    (item.get("exact_registers") or {}).items()
-                )
+    if report.get("guarded_transfer_instantiations"):
+        lines.append("  call-site cases:")
+        for item in report["guarded_transfer_instantiations"]:
+            feasible = ",".join(item.get("feasible_cases") or ()) or "-"
+            ruled = ",".join(item.get("ruled_out_cases") or ()) or "-"
+            exact_regs = ",".join(
+                f"{name}={value:06X}"
+                for name, value in sorted((item.get("exact_registers") or {}).items())
             ) or "-"
-            range_registers = ",".join(
-                f"{register}={_base._base._base._base._format_optional_range(interval)}"
-                for register, interval in sorted(
-                    (item.get("range_registers") or {}).items()
-                )
-            ) or "-"
-            exact_memory = ",".join(
-                f"{cell_id}={value:06X}"
-                for cell_id, value in sorted(
-                    (item.get("exact_memory") or {}).items()
-                )
-            ) or "-"
-            range_memory = ",".join(
-                f"{cell_id}={_base._base._base._base._format_optional_range(interval)}"
-                for cell_id, interval in sorted(
-                    (item.get("range_memory") or {}).items()
-                )
+            exact_mem = ",".join(
+                f"{name}={value:06X}"
+                for name, value in sorted((item.get("exact_memory") or {}).items())
             ) or "-"
             lines.append(
                 f"    {item['call_address']:05X} -> {item.get('callee_entry', 0):05X} "
-                f"reg={exact_registers} reg-range={range_registers} "
-                f"mem={exact_memory} mem-range={range_memory}"
+                f"feasible={feasible} ruled-out={ruled} "
+                f"regs={exact_regs} mem={exact_mem}"
             )
     return "\n".join(lines) + "\n"
 
 
-def annotate_typed_disassembly(
-    rendered,
-    debug_map,
-    control_flow=None,
-):
+def annotate_typed_disassembly(rendered, debug_map, control_flow=None):
     annotated = _annotate_typed_disassembly_base(
         rendered,
         debug_map,
@@ -478,7 +312,6 @@ def annotate_typed_disassembly(
     )
     if control_flow is None:
         return annotated
-
     by_address = {
         node["address"]: node
         for node in control_flow.get("instructions", ())
@@ -489,43 +322,24 @@ def annotate_typed_disassembly(
         try:
             address = (
                 int(parts[0], 16)
-                if len(parts) > 1
-                and len(parts[0]) == 5
+                if len(parts) > 1 and len(parts[0]) == 5
                 else None
             )
         except ValueError:
             address = None
-
         node = by_address.get(address)
-        item = (
-            None
-            if node is None
-            else node.get(
-                "symbolic_memory_input_instantiation"
-            )
-        )
+        item = None if node is None else node.get("guarded_transfer_instantiation")
         if item:
+            feasible = ",".join(item.get("feasible_cases") or ())
             additions = []
-            exact_registers = ",".join(
-                f"{register}={value:06X}"
-                for register, value in sorted(
-                    (item.get("exact_registers") or {}).items()
-                )
+            if feasible:
+                additions.append("guard_cases=" + feasible)
+            exact = ",".join(
+                f"{name}={value:06X}"
+                for name, value in sorted((item.get("exact_registers") or {}).items())
             )
-            exact_memory = ",".join(
-                f"{cell_id}={value:06X}"
-                for cell_id, value in sorted(
-                    (item.get("exact_memory") or {}).items()
-                )
-            )
-            if exact_registers:
-                additions.append(
-                    "mem_in_reg=" + exact_registers
-                )
-            if exact_memory:
-                additions.append(
-                    "mem_in_mem=" + exact_memory
-                )
+            if exact:
+                additions.append("guard_xfer=" + exact)
             if additions:
                 line += " ; " + "; ".join(additions)
         lines.append(line)
