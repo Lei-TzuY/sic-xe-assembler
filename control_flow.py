@@ -3,7 +3,10 @@ from control_flow_symbolic_inputs_base import *
 from control_flow_symbolic_inputs_base import analyze_control_flow as _analyze_control_flow_base
 from control_flow_symbolic_inputs_base import annotate_typed_disassembly as _annotate_typed_disassembly_base
 from control_flow_symbolic_inputs_base import render_control_flow_report as _render_control_flow_report_base
-from guarded_transfers import refine_guarded_transfers
+from guarded_transfers import (
+    infer_guarded_transfer_summaries,
+    refine_guarded_transfers,
+)
 
 
 def _summary_by_entry(items):
@@ -77,22 +80,7 @@ def _restore_prior_ownership(report, ownership, refinement):
     )
 
 
-def _refresh_after_guarded(
-    report,
-    refinement,
-    input_snapshot,
-    symbolic_snapshot,
-    sparse_snapshot,
-    legacy_snapshot,
-):
-    report = _base._refresh_after_symbolic_memory_inputs(
-        report,
-        input_snapshot,
-        symbolic_snapshot,
-        sparse_snapshot,
-        legacy_snapshot,
-    )
-
+def _attach_guarded_layer(report, refinement):
     summaries = list(refinement.get("summaries") or ())
     summary_by_entry = dict(refinement.get("summary_map") or {})
     instantiations = dict(refinement.get("instantiations") or {})
@@ -175,6 +163,40 @@ def _refresh_after_guarded(
     return report
 
 
+def _refresh_after_guarded(
+    report,
+    refinement,
+    input_snapshot,
+    symbolic_snapshot,
+    sparse_snapshot,
+    legacy_snapshot,
+):
+    report = _base._refresh_after_symbolic_memory_inputs(
+        report,
+        input_snapshot,
+        symbolic_snapshot,
+        sparse_snapshot,
+        legacy_snapshot,
+    )
+    return _attach_guarded_layer(report, refinement)
+
+
+def _inference_only_refinement(inferred):
+    summaries = list(inferred.get("summaries") or ())
+    summary_map = dict(inferred.get("summary_map") or {})
+    return {
+        "iterations": 0,
+        "converged": True,
+        "summary_map": summary_map,
+        "summaries": summaries,
+        "instantiations": {},
+        "base_resolutions": 0,
+        "range_base_resolutions": 0,
+        "guarded_functions": 0,
+        "guarded_cases": 0,
+    }
+
+
 def analyze_control_flow(
     image,
     image_start,
@@ -189,13 +211,31 @@ def analyze_control_flow(
         entry_address,
         base_register=base_register,
     )
+    guard_summaries = _guard_base_summaries(report)
+
+    # Most programs have only must-style return behavior. Infer bounded guarded
+    # shapes first, and avoid a second whole-program exact/range/memory fixed
+    # point entirely when no function actually has a usable piecewise summary.
+    inferred = infer_guarded_transfer_summaries(
+        report.get("instructions", []),
+        report.get("edges", []),
+        guard_summaries,
+    )
+    if not any(
+        item.get("guarded_supported")
+        for item in inferred.get("summaries", ())
+    ):
+        return _attach_guarded_layer(
+            report,
+            _inference_only_refinement(inferred),
+        )
+
     legacy_snapshot = _base._base._snapshot_legacy_callsite(report)
     sparse_snapshot = _base._base._snapshot_sparse(report)
     symbolic_snapshot = _base._snapshot_symbolic_memory(report)
     input_snapshot = _snapshot_symbolic_input_refinement(report)
     ownership = _base._snapshot_prior_ownership(report)
 
-    guard_summaries = _guard_base_summaries(report)
     refinement = refine_guarded_transfers(
         report.get("instructions", []),
         report.get("edges", []),
