@@ -6,6 +6,12 @@ from control_flow_sparse_base import render_control_flow_report as _render_contr
 from symbolic_memory_transfers import refine_symbolic_memory_transfers
 
 
+_SPARSE_BASE_RESOLUTIONS = {
+    "sparse-linear-base",
+    "sparse-linear-range-base",
+}
+
+
 def _summary_by_entry(items):
     return {
         item["entry"]: item
@@ -52,6 +58,55 @@ def _snapshot_sparse(report):
         "range_base_resolutions": status.get("range_base_resolutions", 0),
         "multivariate_transfers": status.get("multivariate_transfers", 0),
     }
+
+
+def _snapshot_sparse_base_ownership(report):
+    """Freeze target facts already owned by the proven sparse-register layer."""
+    result = {}
+    for node in report.get("instructions", ()):
+        if node.get("target_resolution") not in _SPARSE_BASE_RESOLUTIONS:
+            continue
+        result[node["address"]] = {
+            "operand": node.get("operand"),
+            "target": node.get("target"),
+            "warning": node.get("warning"),
+            "base_value": node.get("base_value"),
+            "target_resolution": node.get("target_resolution"),
+        }
+    return result
+
+
+def _restore_sparse_base_ownership(report, ownership, refinement):
+    """A later evidence layer may refine new targets, but must not relabel old ones."""
+    by_address = {
+        node["address"]: node
+        for node in report.get("instructions", ())
+    }
+    for address, saved in ownership.items():
+        node = by_address.get(address)
+        if node is None:
+            continue
+        node["operand"] = saved["operand"]
+        node["target"] = saved["target"]
+        node["warning"] = saved["warning"]
+        node["target_resolution"] = saved["target_resolution"]
+        if saved["base_value"] is None:
+            node.pop("base_value", None)
+        else:
+            node["base_value"] = saved["base_value"]
+
+    # Counters describe final ownership, not transient relabeling during the
+    # new fixed point.
+    refinement["base_resolutions"] = sum(
+        1
+        for node in report.get("instructions", ())
+        if node.get("target_resolution") == "symbolic-memory-base"
+    )
+    refinement["range_base_resolutions"] = sum(
+        1
+        for node in report.get("instructions", ())
+        if node.get("target_resolution") == "symbolic-memory-range-base"
+    )
 
 
 def _refresh_after_symbolic_memory(report, refinement, sparse_snapshot, legacy_snapshot):
@@ -145,6 +200,7 @@ def analyze_control_flow(image, image_start, debug_map, entry_address, base_regi
     )
     legacy_snapshot = _snapshot_legacy_callsite(report)
     sparse_snapshot = _snapshot_sparse(report)
+    sparse_base_ownership = _snapshot_sparse_base_ownership(report)
     refinement = refine_symbolic_memory_transfers(
         report.get("instructions", []),
         report.get("edges", []),
@@ -158,6 +214,7 @@ def analyze_control_flow(image, image_start, debug_map, entry_address, base_regi
         memory_summaries=_summary_by_entry(report.get("memory_effect_summaries")),
         base_register=base_register,
     )
+    _restore_sparse_base_ownership(report, sparse_base_ownership, refinement)
     return _refresh_after_symbolic_memory(
         report,
         refinement,
