@@ -4,7 +4,7 @@ The analyzer can preserve a bounded set of path-specific return transfers instea
 
 ## Why this layer exists
 
-Earlier interprocedural layers intentionally use must summaries: a return constant or symbolic formula is reusable only when all represented returns agree. That is sound, but a small helper such as:
+Earlier interprocedural layers intentionally use must summaries: a return constant or symbolic formula is reusable only when all represented returns agree. That is sound, but a helper such as:
 
 ```asm
 CHOOSE COMP #0
@@ -22,116 +22,84 @@ if A_in == 0  -> A_out = 1
 if A_in != 0  -> A_out = 2
 ```
 
-A concrete `JSUB` evaluates the guards using its own exact/range register and direct-memory must-state. Cases that are provably impossible are removed. The remaining outputs are then joined soundly.
+A concrete `JSUB` evaluates the guards using its own exact/range register and direct-memory must-state. Cases that are provably impossible are removed. Remaining outputs are joined soundly.
 
-## Structural path authority
+## Structural authority
 
-Reusable guarded cases are inferred from a pristine structural CFG rebuilt from the decoded instructions. Their path existence, return sites, `may_return`, and `link_register_preserved` facts are never inherited from a caller-specialized summary produced by an earlier exact/range pass.
+Reusable guarded cases are inferred from a pristine structural CFG rebuilt from decoded instructions. Path existence, return sites, `may_return`, and `link_register_preserved` are never inherited from caller-specialized pruning.
 
-This separation is essential. Earlier layers are allowed to prune a callee path when a particular caller proves a condition. Reusing that pruned return shape as a caller-independent function contract would silently erase valid return cases for other callers. Guarded inference therefore treats earlier summaries only as value-transfer hints; pristine structural control-flow facts are authoritative.
+The same rule applies to memory effects. `may_read_cells`, `may_write_cells`, `unknown_read`, `unknown_write`, and preserved-cell shape are rebuilt from the pristine structural CFG before guarded memory contracts are inferred. Earlier layers may contribute value hints, but they cannot erase a valid path or shrink a reusable function's write set merely because one caller proves a condition.
 
 ## Guard representation
 
-A guard is stored as two existing `symbolic-linear` expressions plus an allowed condition-code set:
+A guard stores two `symbolic-linear` expressions plus an allowed condition-code set. `JEQ`, `JLT`, and `JGT` branch/fallthrough edges become complementary allowed sets, and comparison operands may depend on entry registers or direct entry-memory roots.
 
-```json
-{
-  "left": {
-    "kind": "symbolic-linear",
-    "register_coefficients": {"A": 1},
-    "memory_coefficients": {},
-    "offset": 0,
-    "modulus": 16777216
-  },
-  "right": {
-    "kind": "symbolic-linear",
-    "register_coefficients": {},
-    "memory_coefficients": {},
-    "offset": 0,
-    "modulus": 16777216
-  },
-  "allowed": ["EQ"]
-}
-```
+## Register and memory case outputs
 
-`JEQ`, `JLT`, and `JGT` branch/fallthrough edges become complementary allowed sets. For example the `JEQ` fallthrough is `{LT,GT}`, not an invented single relation.
-
-The comparison operands can themselves depend on direct entry-memory roots, so a function that performs `LDA FLAG; COMP #0` can produce cases guarded by `MEM[FLAG]_in`.
-
-## Case outputs
-
-Each case can contain register and direct-memory outputs expressed in the same generic sparse symbolic domain used by memory-input summaries:
+Register outputs retain the existing sparse symbolic representation. Guarded memory contracts additionally expose `memory_contract_cells`, the finite set of tracked cells that the function may write. Every guarded return case explicitly represents every contract cell with one of three states:
 
 ```text
-C0 if A_in == 0 -> A_out=1, MEM[SLOT]_out=7
-C1 if A_in != 0 -> A_out=2, MEM[SLOT]_out=9
+identity         MEM[X]_out = MEM[X]_in
+unknown          MEM[X]_out cannot be represented safely
+symbolic-linear  MEM[X]_out is a sparse symbolic expression
 ```
 
-Constants are represented as zero-term symbolic expressions, while register/memory-dependent outputs retain their sparse coefficients.
+For example:
 
-The first public case schema deliberately omits both unchanged identity outputs and unknown outputs. Consequently a missing memory cell is ambiguous: it may mean `MEM[X]_out = MEM[X]_in`, or it may mean that the path cannot represent a precise value. Until those states have distinct serialization, a guarded memory postcondition is written back into caller must-memory only when that cell has an explicit output formula on every guarded return case. Partial conditional writes therefore remain conservative.
+```asm
+MAYSET COMP #0
+       JEQ KEEP
+       LDX #7
+       STX SLOT
+KEEP   RSUB
+```
+
+can produce:
+
+```text
+A_in == 0 -> MEM[SLOT]_out = identity
+A_in != 0 -> MEM[SLOT]_out = 7
+```
+
+This removes the older ambiguity where an omitted cell could mean either unchanged or unknown. See `guarded-memory-contracts.md` for the complete contract.
 
 ## Call-site evaluation
 
-For each resolved `JSUB` with `link_register_preserved=true`, the analyzer evaluates every guard with:
+For each resolved `JSUB` with `link_register_preserved=true`, the analyzer evaluates guards with exact register facts, signed 24-bit register ranges, exact direct-memory must values, and direct-memory must ranges.
 
-1. exact register facts;
-2. signed 24-bit register ranges;
-3. exact direct-memory must values; and
-4. direct-memory must ranges.
+For memory outputs, `identity` evaluates to the caller's incoming value/range, `unknown` contributes no exact/range postcondition, and `symbolic-linear` is evaluated from caller register/memory facts. An exact result survives only when every feasible case agrees exactly; a range survives only when every feasible case has a representable interval, joined by sound hull. Instantiations expose `memory_modes` so reports distinguish selected identity, unknown, symbolic, or joined behavior.
 
-An exact comparison can choose one case immediately. Interval comparison can also remove impossible cases. Unknown comparisons keep the case feasible rather than guessing.
+## Nested guarded composition
 
-When multiple cases remain:
+A guarded function may compose another guarded callee when the target is resolved, the callee has a supported bounded guarded summary, and `link_register_preserved=true`.
 
-- an exact register output is retained only when every feasible case produces the same exact value;
-- a register range output is the sound hull of every feasible case when every case has a representable interval;
-- a direct-memory output is consumable only when that cell is explicitly represented on every guarded return case, in addition to the same exact/range agreement rules;
-- an unknown or ambiguous output prevents a must-value claim.
+The analyzer does not inline the callee CFG. It forks only over the callee's already-bounded cases, substitutes each callee guard into the outer function's current symbolic register/memory state, applies the selected case outputs, and continues through the outer CFG. Resulting outer cases record `nested_cases` provenance containing call source, callee entry, and case id.
 
-This allows an input range to select a branch even when the caller has no exact constant. For example `A_in in [0,1]` proves `A_in < 10`, so only the `<10` return case remains.
+Composition is a monotone summary fixed point: leaf guarded summaries become available first, then callers may consume them on later inference iterations. An outer function may gain a precise guarded summary for reporting/composition while still remaining unconsumable by its own callers if its structural `link_register_preserved` proof is false.
 
-## CFG feedback
+## CFG feedback and proof ownership
 
-Selected guarded outputs are merged with the already established symbolic-memory-input call-site instantiation, then fed through the existing memory-aware exact/range passes. They can therefore:
+Selected guarded outputs are merged with established symbolic-memory-input call-site instantiations and fed through the existing memory-aware exact/range passes. They can prove caller comparisons, prune branches, return direct-memory facts, and recover B for base-relative target resolution.
 
-- prove caller comparisons and prune impossible branches;
-- return path-specific direct-memory values when every guarded return explicitly defines the cell, allowing later loads to consume the selected value; and
-- recover a path-specific B value for base-relative target resolution.
-
-New proof provenance is used only when this layer is the first owner:
-
-```text
-guarded-transfer-condition
-guarded-transfer-range-condition
-guarded-transfer-base
-guarded-transfer-range-base
-```
-
-Older target/edge proof ownership is snapshotted and restored. A later guarded pass never relabels a fact already proven by an earlier layer.
+New proof provenance is used only when this layer is the first owner. Older target/edge proof ownership is snapshotted and restored. A later guarded pass never relabels a fact already proven by an earlier layer. Likewise, an older must-summary can remain intentionally conservative while the later guarded call-site layer proves a caller-specific postcondition.
 
 ## Bounds and fail-conservative rules
 
-This is deliberately not an unrestricted symbolic executor.
-
-- At most eight distinct guarded return cases are retained.
+- At most eight distinct guarded return cases are retained per function.
 - At most 128 path states are explored per function.
 - A control-flow revisit/loop disables guarded summarization for that function.
-- Guards are currently derived from symbolic `COMP`/`COMPR` state feeding `JEQ/JLT/JGT`.
-- `TIX/TIXR` comparisons are not represented as guarded symbolic relations in this layer.
-- If a conditional branch has no representable symbolic comparison, the guarded summary is disabled rather than made unconditional.
-- Structural path facts always come from the pristine instruction CFG, never from caller-specific pruning.
-- All underlying symbolic expressions still obey the combined four-root sparse term budget.
-- Signed 24-bit range wrap degrades to unknown.
-- Indexed/indirect/unresolved aliases retain the previous fail-conservative memory behavior.
-- A guarded memory cell is written back only when every guarded return case explicitly represents that cell.
-- Call-site consumption remains gated by the existing structural `link_register_preserved` proof.
-
-Loops, richer boolean/path constraint simplification, explicit identity-vs-unknown memory outputs, and guarded nested-callee composition can be added later without changing the public meaning of the existing must-summary layers.
+- Guards currently come from symbolic `COMP`/`COMPR` feeding `JEQ/JLT/JGT`.
+- `TIX/TIXR` comparisons are not represented as guarded symbolic relations here.
+- Failed nested guard substitution falls back to the existing must-summary.
+- Nested guarded consumption requires proven link-register preservation.
+- All symbolic expressions obey the existing sparse root budget.
+- Signed 24-bit wrap degrades to unknown.
+- Indexed/indirect/unresolved aliases retain fail-conservative memory behavior.
+- Pristine structural CFG and pristine memory-effect shape are authoritative for reusable summaries.
 
 ## Public report fields
 
-The new layer is additive:
+The guarded layer remains additive:
 
 ```text
 guarded_transfer_summaries
@@ -139,6 +107,13 @@ guarded_transfer_instantiations
 guarded_transfers
 ```
 
-Existing register, memory, sparse-linear, and symbolic-memory-input summary schemas remain unchanged.
+Additional guarded fields include:
 
-The assembler, object format, linker, linked image, manifest, INPUTSET/LINKID, and historical golden artifacts are outside this analysis-only layer.
+```text
+memory_contract_cells
+guarded_nested_composed_calls
+nested_cases
+memory_modes
+```
+
+Existing register, memory, sparse-linear, symbolic-memory-input, assembler, object, linker, linked-image, manifest, INPUTSET/LINKID, and historical golden contracts remain unchanged.
