@@ -8,6 +8,16 @@ class GuardedRefinementError(ValueError):
     pass
 
 
+def _register_contract_registers(summary):
+    return tuple(
+        sorted(
+            register
+            for register in ((summary or {}).get("may_clobber") or ())
+            if register in TRACKED_REGISTERS
+        )
+    )
+
+
 def _memory_contract_cells(summary, cells):
     known = {_cell_id(cell) for cell in cells}
     if (summary or {}).get("unknown_write"):
@@ -21,6 +31,14 @@ def _memory_contract_cells(summary, cells):
     )
 
 
+def _register_output_spec(expression, register):
+    if expression is None:
+        return {"kind": "unknown"}
+    if expression == _legacy._source_register(register):
+        return {"kind": "identity"}
+    return _legacy._serialize(expression)
+
+
 def _memory_output_spec(expression, cell_id):
     if expression is None:
         return {"kind": "unknown"}
@@ -29,10 +47,30 @@ def _memory_output_spec(expression, cell_id):
     return _legacy._serialize(expression)
 
 
-def _path_outputs(registers, memory, contract_cells, cells_by_id):
+def _path_outputs(
+    registers,
+    memory,
+    contract_registers,
+    contract_cells,
+    cells_by_id,
+):
     register_outputs = {}
     memory_outputs = {}
+
+    for register in contract_registers:
+        register_outputs[register] = _register_output_spec(
+            registers.get(register),
+            register,
+        )
+
+    # Preserve the historical surface for any non-contract register that still
+    # has a non-identity symbolic output. Structural may-clobber summaries
+    # should normally make this empty, but keeping it is fail-safe and avoids
+    # silently dropping information if a future instruction summary is more
+    # precise than the current structural write classifier.
     for register in TRACKED_REGISTERS:
+        if register in register_outputs:
+            continue
         expression = registers.get(register)
         if expression is None or expression == _legacy._source_register(register):
             continue
@@ -90,6 +128,7 @@ def _summary_signature(summaries):
             entry,
             bool(summary.get("guarded_supported")),
             summary.get("guarded_reason"),
+            tuple(summary.get("register_contract_registers") or ()),
             tuple(summary.get("memory_contract_cells") or ()),
             tuple(
                 _case_signature(case)
@@ -157,11 +196,17 @@ def _apply_guarded_case(
     for register, spec in (case.get("register_outputs") or {}).items():
         if register not in TRACKED_REGISTERS:
             continue
-        result_registers[register] = _substitute(
-            _deserialize(spec),
-            input_registers,
-            memory_inputs_by_id,
-        )
+        kind = None if spec is None else spec.get("kind")
+        if kind == "identity":
+            result_registers[register] = input_registers.get(register)
+        elif kind == "unknown" or spec is None:
+            result_registers[register] = None
+        else:
+            result_registers[register] = _substitute(
+                _deserialize(spec),
+                input_registers,
+                memory_inputs_by_id,
+            )
 
     for cell_id in (summary or {}).get("memory_contract_cells") or ():
         cell = cells_by_id.get(cell_id)
@@ -249,6 +294,7 @@ def _analyze_guarded_function(
 ):
     cells, operations = _legacy._tracked_cells(nodes)
     cells_by_id = {_cell_id(cell): cell for cell in cells}
+    contract_registers = _register_contract_registers(summary)
     contract_cells = _memory_contract_cells(summary, cells)
     by_address = {node["address"]: node for node in nodes}
     outgoing = {}
@@ -269,6 +315,7 @@ def _analyze_guarded_function(
             "supported": False,
             "reason": "no-return-shape",
             "cases": [],
+            "register_contract_registers": list(contract_registers),
             "memory_contract_cells": list(contract_cells),
             "nested_composed_calls": 0,
         }
@@ -294,6 +341,7 @@ def _analyze_guarded_function(
                 "supported": False,
                 "reason": "path-budget",
                 "cases": [],
+                "register_contract_registers": list(contract_registers),
                 "memory_contract_cells": list(contract_cells),
                 "nested_composed_calls": len(composed_calls),
             }
@@ -305,6 +353,7 @@ def _analyze_guarded_function(
                 "supported": False,
                 "reason": "loop-or-revisit",
                 "cases": [],
+                "register_contract_registers": list(contract_registers),
                 "memory_contract_cells": list(contract_cells),
                 "nested_composed_calls": len(composed_calls),
             }
@@ -343,6 +392,7 @@ def _analyze_guarded_function(
             register_outputs, memory_outputs = _path_outputs(
                 registers_after,
                 memory_after,
+                contract_registers,
                 contract_cells,
                 cells_by_id,
             )
@@ -364,6 +414,7 @@ def _analyze_guarded_function(
                     "supported": False,
                     "reason": "case-budget",
                     "cases": [],
+                    "register_contract_registers": list(contract_registers),
                     "memory_contract_cells": list(contract_cells),
                     "nested_composed_calls": len(composed_calls),
                 }
@@ -376,6 +427,7 @@ def _analyze_guarded_function(
                 "supported": False,
                 "reason": "unguarded-condition",
                 "cases": [],
+                "register_contract_registers": list(contract_registers),
                 "memory_contract_cells": list(contract_cells),
                 "nested_composed_calls": len(composed_calls),
             }
@@ -405,6 +457,7 @@ def _analyze_guarded_function(
                         "supported": False,
                         "reason": "unguarded-edge",
                         "cases": [],
+                        "register_contract_registers": list(contract_registers),
                         "memory_contract_cells": list(contract_cells),
                         "nested_composed_calls": len(composed_calls),
                     }
@@ -483,6 +536,7 @@ def _analyze_guarded_function(
             "supported": False,
             "reason": "not-piecewise",
             "cases": [],
+            "register_contract_registers": list(contract_registers),
             "memory_contract_cells": list(contract_cells),
             "nested_composed_calls": len(composed_calls),
             "explored_states": explored,
@@ -494,6 +548,7 @@ def _analyze_guarded_function(
         "supported": True,
         "reason": None,
         "cases": deduped,
+        "register_contract_registers": list(contract_registers),
         "memory_contract_cells": list(contract_cells),
         "nested_composed_calls": len(composed_calls),
         "explored_states": explored,
@@ -537,6 +592,9 @@ def infer_guarded_transfer_summaries(nodes, edges, base_summaries):
                 item,
                 available,
             )
+            item["register_contract_registers"] = analyzed[
+                "register_contract_registers"
+            ]
             item["memory_contract_cells"] = analyzed[
                 "memory_contract_cells"
             ]
@@ -568,6 +626,85 @@ def infer_guarded_transfer_summaries(nodes, edges, base_summaries):
     raise GuardedRefinementError(
         "Guarded summary composition did not converge"
     )
+
+
+def _register_spec_value(
+    spec,
+    register,
+    register_exact,
+    register_ranges,
+    memory_exact,
+    memory_ranges,
+):
+    if not spec:
+        return None, None
+    kind = spec.get("kind")
+    if kind == "identity":
+        exact = (register_exact or {}).get(register)
+        interval = (register_ranges or {}).get(register)
+    elif kind == "unknown":
+        return None, None
+    else:
+        exact = _legacy._evaluate_exact(
+            spec,
+            register_exact or {},
+            memory_exact or {},
+        )
+        interval = _legacy._evaluate_range(
+            spec,
+            register_ranges or {},
+            memory_ranges or {},
+        )
+
+    if interval is None and exact is not None:
+        interval = _legacy._signed_singleton(exact)
+    return exact, interval
+
+
+def _join_register_case_output(
+    cases,
+    register,
+    register_exact,
+    register_ranges,
+    memory_exact,
+    memory_ranges,
+):
+    exact_values = []
+    intervals = []
+    complete_ranges = True
+
+    for case in cases:
+        spec = (case.get("register_outputs") or {}).get(register)
+        exact, interval = _register_spec_value(
+            spec,
+            register,
+            register_exact,
+            register_ranges,
+            memory_exact,
+            memory_ranges,
+        )
+        exact_values.append(exact)
+        if interval is None:
+            complete_ranges = False
+        else:
+            intervals.append(interval)
+
+    exact = (
+        exact_values[0]
+        if exact_values
+        and exact_values[0] is not None
+        and all(value == exact_values[0] for value in exact_values)
+        else None
+    )
+    interval = (
+        (
+            min(item[0] for item in intervals),
+            max(item[1] for item in intervals),
+        )
+        if complete_ranges and intervals
+        else None
+    )
+    return exact, interval
 
 
 def _memory_spec_value(
@@ -694,7 +831,8 @@ def instantiate_guarded_calls(
         range_memory = {}
 
         register_keys = sorted(
-            {
+            set(summary.get("register_contract_registers") or ())
+            | {
                 register
                 for case in feasible
                 for register in (
@@ -702,11 +840,11 @@ def instantiate_guarded_calls(
                 )
             }
         )
+        register_modes = {}
         for register in register_keys:
-            exact, interval = _legacy._join_case_output(
+            exact, interval = _join_register_case_output(
                 feasible,
                 register,
-                "register_outputs",
                 register_exact,
                 register_ranges,
                 memory_exact,
@@ -718,6 +856,17 @@ def instantiate_guarded_calls(
                 )
             if interval is not None:
                 range_registers[register] = list(interval)
+
+            modes = {
+                ((case.get("register_outputs") or {}).get(register) or {}).get(
+                    "kind", "unknown"
+                )
+                for case in feasible
+            }
+            if len(modes) == 1:
+                register_modes[register] = next(iter(modes))
+            elif modes:
+                register_modes[register] = "joined"
 
         memory_modes = {}
         for cell_id in summary.get("memory_contract_cells") or ():
@@ -755,6 +904,7 @@ def instantiate_guarded_calls(
             ],
             "exact_registers": exact_registers,
             "range_registers": range_registers,
+            "register_modes": register_modes,
             "exact_memory": exact_memory,
             "range_memory": range_memory,
             "memory_modes": memory_modes,
@@ -771,6 +921,11 @@ def _summary_metrics(summaries):
         for summary in values
         for case in summary.get("guarded_cases", ())
     ]
+    register_specs = [
+        spec
+        for case in cases
+        for spec in (case.get("register_outputs") or {}).values()
+    ]
     memory_specs = [
         spec
         for case in cases
@@ -780,6 +935,14 @@ def _summary_metrics(summaries):
         "nested_composed_calls": sum(
             summary.get("guarded_nested_composed_calls", 0)
             for summary in values
+        ),
+        "register_identity_outputs": sum(
+            1 for spec in register_specs
+            if spec.get("kind") == "identity"
+        ),
+        "register_unknown_outputs": sum(
+            1 for spec in register_specs
+            if spec.get("kind") == "unknown"
         ),
         "memory_identity_outputs": sum(
             1 for spec in memory_specs
