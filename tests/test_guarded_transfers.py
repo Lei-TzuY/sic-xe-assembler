@@ -262,13 +262,15 @@ class GuardedTransferTests(unittest.TestCase):
     def test_guarded_returned_base_resolves_base_relative_jump(self):
         report = self.assemble_and_link(
             "MAIN START 0\n"
-            "ENTRY LDA #0\n"
+            "ENTRY LDA #1\n"
+            "      +JSUB SETB\n"
+            "      LDA #0\n"
             "      +JSUB SETB\n"
             "      BASE 0\n"
             "      J FAR\n"
             "SETB  COMP #0\n"
             "      JEQ GOODB\n"
-            "      CLEAR B\n"
+            "      +LDB #0x4008\n"
             "      RSUB\n"
             "GOODB +LDB #0x4000\n"
             "      RSUB\n"
@@ -276,9 +278,14 @@ class GuardedTransferTests(unittest.TestCase):
             "FAR   RSUB\n"
             "      END ENTRY\n"
         )
-        call = self.calls_to(report, "SETB")[0]
+        calls = self.calls_to(report, "SETB")
+        self.assertEqual(len(calls), 2)
         self.assertEqual(
-            call["guarded_transfer_instantiation"]["exact_registers"]["B"],
+            calls[0]["guarded_transfer_instantiation"]["exact_registers"]["B"],
+            0x4008,
+        )
+        self.assertEqual(
+            calls[1]["guarded_transfer_instantiation"]["exact_registers"]["B"],
             0x4000,
         )
         jump = next(
@@ -292,7 +299,7 @@ class GuardedTransferTests(unittest.TestCase):
     def test_looped_function_degrades_instead_of_path_exploding(self):
         report = self.assemble_and_link(
             "MAIN START 0\n"
-            "ENTRY LDA #2\n"
+            "ENTRY LDA FLAG\n"
             "      +JSUB LOOPF\n"
             "      RSUB\n"
             "LOOPF COMP #0\n"
@@ -300,6 +307,7 @@ class GuardedTransferTests(unittest.TestCase):
             "      SUB #1\n"
             "      J LOOPF\n"
             "DONE  RSUB\n"
+            "FLAG  RESW 1\n"
             "      END ENTRY\n"
         )
         summary = self.summary_for(report, "LOOPF")
