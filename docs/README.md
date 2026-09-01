@@ -14,6 +14,7 @@
 - `symbolic-memory-transfers.md` — caller-independent memory-cell formulas over entry registers, nested substitution, call-site exact/range memory instantiation, and memory→register/CFG feedback.
 - `symbolic-memory-inputs.md` — direct memory cells as symbolic function inputs, memory↔register sparse formulas, nested composition, per-call memory/register substitution, and CFG feedback.
 - `guarded-transfers.md` — bounded path-sensitive return cases, symbolic register/memory guards, caller-specific case selection, structural path authority, and fail-conservative memory postconditions.
+- `guarded-memory-contracts.md` — explicit identity/unknown/symbolic memory case outputs, pristine memory-effect authority, and bounded nested guarded-callee composition.
 - `analysis-contract.md` — trust boundary and fail-conservative guarantees.
 - `analysis-examples.md` — compact scenarios that exercise exact/range pruning, call summaries, proven returns, and base recovery.
 - `analysis-status.md` — current capability boundary, supported cases, and intentionally conservative cases.
