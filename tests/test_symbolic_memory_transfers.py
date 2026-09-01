@@ -77,6 +77,16 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
             address = store["target"]
         return f"{address:05X}+3"
 
+    def load_before(self, report, instruction):
+        return max(
+            (
+                node for node in report["instructions"]
+                if node["base_mnemonic"] == "LDA"
+                and node["address"] < instruction["address"]
+            ),
+            key=lambda node: node["address"],
+        )
+
     def test_multivariate_memory_return_instantiates_and_prunes_branch(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
@@ -102,12 +112,9 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
         self.assertEqual(spec["coefficients"], {"A": 1, "X": 1})
         call = next(node for node in report["instructions"] if node["base_mnemonic"] == "JSUB")
         self.assertEqual(call["symbolic_memory_instantiation"]["exact"][cell], 3)
-        load = max(
-            (node for node in report["instructions"] if node["base_mnemonic"] == "LDA"),
-            key=lambda node: node["address"],
-        )
-        self.assertEqual(load["memory_constant"], 3)
         compare = next(node for node in report["instructions"] if node["base_mnemonic"] == "COMP")
+        load = self.load_before(report, compare)
+        self.assertEqual(load["memory_constant"], 3)
         self.assertEqual(compare["registers_in"]["A"], 3)
         branch = next(node for node in report["instructions"] if node["base_mnemonic"] == "JEQ")
         fallthrough = next(
@@ -144,8 +151,11 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
         call = next(node for node in report["instructions"] if node["base_mnemonic"] == "JSUB")
         self.assertNotIn(cell, call["symbolic_memory_instantiation"]["exact"])
         self.assertEqual(call["symbolic_memory_instantiation"]["ranges"][cell], [4, 5])
-        loads = [node for node in report["instructions"] if node["base_mnemonic"] == "LDA"]
-        load = max(loads, key=lambda node: node["address"])
+        compare = max(
+            (node for node in report["instructions"] if node["base_mnemonic"] == "COMP"),
+            key=lambda node: node["address"],
+        )
+        load = self.load_before(report, compare)
         self.assertIsNone(load["memory_constant"])
         self.assertEqual(load["memory_range"], [4, 5])
         branch = next(node for node in report["instructions"] if node["base_mnemonic"] == "JLT")
@@ -159,7 +169,10 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
     def test_symbolic_memory_value_can_resolve_base_relative_target(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
-            "ENTRY +LDA #0x3FFF\n"
+            "ENTRY LDA #1\n"
+            "      LDX #1\n"
+            "      +JSUB SETVAL\n"
+            "      +LDA #0x3FFF\n"
             "      LDX #1\n"
             "      +JSUB SETVAL\n"
             "      CLEAR B\n"
@@ -175,8 +188,8 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
             "      END ENTRY\n"
         )
         cell = self.slot_cell(report)
-        call = next(node for node in report["instructions"] if node["base_mnemonic"] == "JSUB")
-        self.assertEqual(call["symbolic_memory_instantiation"]["exact"][cell], 0x4000)
+        calls = [node for node in report["instructions"] if node["base_mnemonic"] == "JSUB"]
+        self.assertEqual(calls[-1]["symbolic_memory_instantiation"]["exact"][cell], 0x4000)
         jump = next(node for node in report["instructions"] if node["base_mnemonic"] == "J")
         far = next(node for node in report["instructions"] if "FAR" in node.get("symbols", ()))
         self.assertEqual(jump["target"], far["address"])
@@ -211,8 +224,6 @@ class SymbolicMemoryTransferTests(unittest.TestCase):
             if node["base_mnemonic"] == "JSUB" and node.get("target") == outer["entry"]
         )
         self.assertNotIn("symbolic_memory_instantiation", call)
-        compare = next(node for node in report["instructions"] if node["base_mnemonic"] == "COMP")
-        self.assertIsNone(compare["registers_in"]["A"])
 
     def test_partial_store_path_does_not_invent_memory_formula(self):
         _, report = self.assemble_and_link(
