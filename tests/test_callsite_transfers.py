@@ -170,7 +170,7 @@ class CallsiteTransferTests(unittest.TestCase):
         self.assertEqual(jump["target"], far["address"])
         self.assertEqual(jump["target_resolution"], "call-transfer-base")
 
-    def test_multivariate_register_expression_remains_unsupported(self):
+    def test_multivariate_stays_out_of_legacy_summary_but_sparse_layer_refines(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
             "ENTRY LDA #1\n"
@@ -184,13 +184,26 @@ class CallsiteTransferTests(unittest.TestCase):
             "      RSUB\n"
             "      END ENTRY\n"
         )
-        summary = self.summary_for(report, "MIXER")
-        self.assertNotIn("A", summary["return_transfers"])
+        legacy = self.summary_for(report, "MIXER")
+        self.assertNotIn("A", legacy["return_transfers"])
+        sparse = next(
+            summary
+            for summary in report["sparse_linear_transfer_summaries"]
+            if summary["entry"] == legacy["entry"]
+        )
+        self.assertEqual(
+            sparse["return_linear_transfers"]["A"].get("coefficients"),
+            {"A": 1, "X": 1},
+        )
         compare = next(node for node in report["instructions"] if node["base_mnemonic"] == "COMP")
-        self.assertIsNone(compare["registers_in"]["A"])
+        self.assertEqual(compare["registers_in"]["A"], 3)
         branch = next(node for node in report["instructions"] if node["base_mnemonic"] == "JEQ")
-        outgoing = [edge for edge in report["edges"] if edge["source"] == branch["address"]]
-        self.assertTrue(all(edge["resolved"] for edge in outgoing))
+        fallthrough = next(
+            edge for edge in report["edges"]
+            if edge["source"] == branch["address"] and edge["kind"] == "fallthrough"
+        )
+        self.assertFalse(fallthrough["resolved"])
+        self.assertEqual(fallthrough["resolution"], "sparse-linear-condition")
 
     def test_nested_symbolic_summary_is_not_consumed_without_link_proof(self):
         _, report = self.assemble_and_link(
