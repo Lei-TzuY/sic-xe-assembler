@@ -11,4 +11,5 @@
 - `register-postconditions.md` — caller-independent register/CC return constants and ranges, nested composition, link-register gating, caller branch pruning, and returned-B target recovery.
 - `callsite-transfers.md` — single-source affine register return formulas, call-site exact/range substitution, symbolic CFG feedback, and returned-B target recovery.
 - `sparse-linear-transfers.md` — bounded multivariate linear register formulas, sparse coefficient vectors, nested substitution, call-site exact/range instantiation, and CFG feedback.
+- `symbolic-memory-transfers.md` — caller-independent memory-cell formulas over entry registers, nested substitution, call-site exact/range memory instantiation, and memory→register/CFG feedback.
 - `analysis-contract.md` — trust boundary and fail-conservative guarantees.
