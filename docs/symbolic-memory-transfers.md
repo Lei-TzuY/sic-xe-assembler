@@ -51,7 +51,7 @@ Overlapping direct stores invalidate overlapping cells unless the write exactly 
 Every function is analyzed from caller-independent entry state:
 
 - each tracked register starts as its own symbolic input;
-- tracked memory starts unknown;
+- tracked memory starts unknown in this register-rooted layer;
 - direct stores can establish symbolic memory formulas;
 - resolved nested callees can contribute their proven memory formulas by symbolic substitution;
 - CFG joins preserve a formula only when every represented predecessor agrees exactly.
@@ -113,15 +113,25 @@ Instantiated memory facts are fed into the existing memory-aware register/range 
 
 After an edge or target changes, the higher-level CFG wrapper rebuilds structural products and reruns downstream liveness, reaching-definition, memory provenance, function, ownership, dominator, loop, and complexity analyses.
 
-## Non-goals
+## Relationship to memory-input transfers
 
-This is not a general symbolic heap or alias solver. The current layer intentionally does not model:
+This layer deliberately remains rooted in entry registers. The next `symbolic-memory-inputs.md` layer treats direct memory cells as symbolic function inputs and can therefore express formulas such as:
+
+```text
+A_out = MEM[SLOT]_in
+MEM[OUT]_out = MEM[IN]_in + X_in + 1
+```
+
+Keeping the layers separate preserves compatibility and makes proof ownership explicit: register-rooted memory formulas remain here, while formulas that require entry-memory roots are published by the memory-input layer.
+
+## Remaining non-goals
+
+Neither layer is a general symbolic heap or alias solver. Unsupported cases still include:
 
 - symbolic memory addresses;
 - indexed or indirect cell identities;
-- arbitrary memory-to-memory symbolic formulas;
-- nonlinear register formulas;
-- more than four symbolic register terms;
-- caller-specific memory inputs promoted into reusable function summaries.
+- nonlinear symbolic memory/register formulas;
+- more than four surviving symbolic roots;
+- arbitrary alias-sensitive heap updates.
 
 Unsupported cases degrade to unknown rather than fabricating precision.
