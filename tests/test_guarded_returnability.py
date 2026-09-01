@@ -219,9 +219,7 @@ class GuardedReturnabilityTests(unittest.TestCase):
             {case["returns"] for case in summary["returnability_cases"]},
         )
         call = self.calls_to(report, "MAYESC")[0]
-        item = call["guarded_transfer_instantiation"]
-        self.assertEqual(item["return_mode"], "unknown")
-        self.assertFalse(item["must_not_return"])
+        self.assertNotIn("guarded_transfer_instantiation", call)
         fallthrough = next(
             edge for edge in report["edges"]
             if edge.get("source") == call["address"]
