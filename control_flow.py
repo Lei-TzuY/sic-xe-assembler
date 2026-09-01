@@ -3,7 +3,7 @@ from control_flow_symbolic_inputs_base import *
 from control_flow_symbolic_inputs_base import analyze_control_flow as _analyze_control_flow_base
 from control_flow_symbolic_inputs_base import annotate_typed_disassembly as _annotate_typed_disassembly_base
 from control_flow_symbolic_inputs_base import render_control_flow_report as _render_control_flow_report_base
-from guarded_transfers import (
+from guarded_transfer_refinement import (
     infer_guarded_transfer_summaries,
     refine_guarded_transfers,
 )
