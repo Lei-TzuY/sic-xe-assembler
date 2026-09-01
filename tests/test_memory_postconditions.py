@@ -165,7 +165,7 @@ class MemoryPostconditionTests(unittest.TestCase):
         self.assertEqual(load["memory_range"], [1, 2])
         self.assertEqual(load["ranges_out"]["B"], (1, 2))
 
-    def test_conditional_callee_write_does_not_invent_postcondition(self):
+    def test_conditional_callee_write_stays_out_of_must_summary_but_guarded_refines_callsite(self):
         _, report = self.assemble_and_link(
             "MAIN START 0\n"
             "ENTRY LDA #3\n"
@@ -187,8 +187,13 @@ class MemoryPostconditionTests(unittest.TestCase):
         cell = load["memory_cell_read"]
         self.assertNotIn(cell, call["memory_effect_summary"]["return_constants"])
         self.assertNotIn(cell, call["memory_effect_summary"]["return_ranges"])
-        self.assertIsNone(load["memory_constant"])
-        self.assertIsNone(load["memory_range"])
+
+        guarded = call["guarded_transfer_instantiation"]
+        self.assertIsNotNone(guarded)
+        self.assertEqual(len(guarded["feasible_cases"]), 1)
+        self.assertEqual(guarded["exact_memory"][cell], 7)
+        self.assertEqual(load["memory_constant"], 7)
+        self.assertEqual(load["registers_out"]["B"], 7)
 
     def test_nested_callee_postcondition_composes_through_outer(self):
         _, report = self.assemble_and_link(
