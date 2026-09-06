@@ -1,0 +1,36 @@
+name: Diagnose PR 30 merge
+
+on:
+  push:
+    branches:
+      - automation/pr30-merge-diagnostic
+    paths:
+      - '.github/workflows/pr30-merge-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/cross-domain-fixed-point
+          fetch-depth: 0
+      - name: Attempt merge with current main
+        shell: bash
+        run: |
+          set +e
+          git fetch origin main
+          git merge --no-commit --no-ff origin/main
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "MERGE_CLEAN"
+            exit 0
+          fi
+          echo "UNMERGED_FILES"
+          git diff --name-only --diff-filter=U
+          echo "CONFLICT_DIFF"
+          git diff --cc -- control_flow.py docs/README.md tests/test_memory_dataflow.py
+          exit "$rc"
