@@ -1,0 +1,44 @@
+name: SIC/XE freeze audit
+
+on:
+  push:
+    branches:
+      - automation/pr30-merge-diagnostic
+    paths:
+      - '.github/workflows/sicxe-freeze-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Guard exact source main
+        run: test "$(git rev-parse HEAD)" = "a58f4b5c7f34675fddf437d4af596cd81b5d891f"
+      - name: Audit reachable commit attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          messages="$(git log --format=%B)"
+          for marker in 'Co-Authored-By' 'Generated-By' 'Assisted-By' 'Signed-off-by' 'Anthropic' 'OpenAI'; do
+            if printf '%s\n' "$messages" | grep -F -i -q -- "$marker"; then
+              echo "disallowed attribution marker found: $marker" >&2
+              printf '%s\n' "$messages" | grep -F -i -n -- "$marker" | head -20 >&2
+              exit 1
+            fi
+          done
+      - name: Audit repository hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e .gitmodules
+          test ! -e __pycache__
+          test ! -e .pytest_cache
+          test ! -e dist
+          test ! -e build
+          git status --short
